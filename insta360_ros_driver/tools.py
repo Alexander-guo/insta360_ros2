@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
-import rosbag
-import rospy
 import cv2
-from cv_bridge import CvBridge
 from sensor_msgs.msg import CompressedImage
 import numpy as np
-from tqdm import tqdm
-import os
-import rospkg
 
 def split_image(image):
     height, width = image.shape[:2]

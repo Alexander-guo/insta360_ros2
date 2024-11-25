@@ -1,57 +1,115 @@
 #!/usr/bin/env python3
 
-import rospy
-import rospkg
 import os
 import subprocess
-import signal
 import sys
 import datetime
 
-# Function to handle SIGINT (Ctrl + C)
-def signal_handler(sig, frame):
-    global process
-    rospy.logwarn('Stopping recording...')
-    process.terminate()
-    process.wait()
-    rospy.logwarn('Recording stopped.')
-    sys.exit(0)
+import rclpy
+from rclpy.node import Node
+from rclpy.exceptions import ParameterNotDeclaredException
+
+class RecordNode(Node):
+    def __init__(self):
+        super().__init__('record')
+
+        # Declare parameters with default values
+        self.declare_parameter('bag_type', 'compressed')
+        self.declare_parameter('raw_bag_folder', '/home/bag/raw')
+        self.declare_parameter('compressed_bag_folder', '/home/bag/compressed')
+        self.declare_parameter('undistorted_bag_folder', '/home/bag/undistorted')
+        self.declare_parameter('image_save_directory', '/home/saved_images')
+
+        # Retrieve parameters
+        self.bag_type = self.get_parameter('bag_type').get_parameter_value().string_value
+
+        self.raw_bag_folder = self.get_parameter('raw_bag_folder').get_parameter_value().string_value
+        self.compressed_bag_folder = self.get_parameter('compressed_bag_folder').get_parameter_value().string_value
+        self.undistorted_bag_folder = self.get_parameter('undistorted_bag_folder').get_parameter_value().string_value
+        self.image_save_directory = self.get_parameter('image_save_directory').get_parameter_value().string_value
+
+        # Get current timestamp
+        current_time = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+
+        # Determine output directory and topics based on bag_type
+        if self.bag_type == 'raw':
+            output_dir = os.path.join(self.raw_bag_folder, f"{current_time}_raw")
+            topics = ['/insta_image_yuv']
+        elif self.bag_type == 'compressed':
+            output_dir = os.path.join(self.compressed_bag_folder, f"{current_time}_compressed")
+            topics = ['/back_camera_image/compressed', '/front_camera_image/compressed']
+        elif self.bag_type == 'undistorted':
+            output_dir = os.path.join(self.undistorted_bag_folder, f"{current_time}_undistorted")
+            topics = ['/back_camera_image/compressed', '/front_camera_image/compressed']
+        else:
+            self.get_logger().error('Invalid `bag_type` parameter. Valid options are: raw, compressed, undistorted.')
+            rclpy.shutdown()
+            return
+
+        # Ensure the image_save_directory exists
+        if not os.path.exists(self.image_save_directory):
+            try:
+                os.makedirs(self.image_save_directory)
+                self.get_logger().info(f'Created image save directory: {self.image_save_directory}')
+            except OSError as e:
+                self.get_logger().error(f'Failed to create image save directory {self.image_save_directory}: {e}')
+                rclpy.shutdown()
+                return
+
+        # Ensure the bag output directory exists
+        if not os.path.exists(output_dir):
+            try:
+                os.makedirs(output_dir)
+                self.get_logger().info(f'Created bag output directory: {output_dir}')
+            except OSError as e:
+                self.get_logger().error(f'Failed to create bag output directory {output_dir}: {e}')
+                rclpy.shutdown()
+                return
+        else:
+            self.get_logger().warn(f'Bag output directory {output_dir} already exists.')
+
+        self.get_logger().warn(f"Recording to: {output_dir}")
+
+        # Build the ros2 bag record command
+        command = ['ros2', 'bag', 'record', '-o', output_dir] + topics
+
+        # Start the recording subprocess
+        try:
+            self.process = subprocess.Popen(command)
+            self.get_logger().info(f"Started ros2 bag record with command: {' '.join(command)}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to start ros2 bag record: {e}")
+            rclpy.shutdown()
+            return
+
+    def destroy_node(self):
+        self.get_logger().warn('Stopping recording...')
+        if hasattr(self, 'process') and self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+                self.get_logger().warn('Recording stopped gracefully.')
+            except subprocess.TimeoutExpired:
+                self.get_logger().error('Recording process did not terminate in time. Killing process.')
+                self.process.kill()
+                self.process.wait()
+            except Exception as e:
+                self.get_logger().error(f'Error while terminating recording process: {e}')
+        else:
+            self.get_logger().info('Recording process already terminated.')
+        super().destroy_node()
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = RecordNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info('Keyboard interrupt received. Shutting down node.')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
-    rospy.init_node('record_node')
-    bag_type = rospy.get_param('bag_type', 'compressed')
-
-    default_dir = rospkg.RosPack().get_path('insta360_ros_driver')
-    default_dir = os.path.join(default_dir, 'bag')
-    raw_bag_folder = rospy.get_param('raw_bag_folder', os.path.join(default_dir, 'raw'))
-    compressed_bag_folder = rospy.get_param('compressed_bag_folder', os.path.join(default_dir, 'compressed'))
-    undistorted_bag_folder = rospy.get_param('undistorted_bag_folder', os.path.join(default_dir, 'undistorted'))
-
-    time = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
-
-    if bag_type == 'raw':
-        filename = f"{raw_bag_folder}/{time}_raw.bag"
-        command = f"rosbag record -O {filename} /insta_image_yuv"
-        record_location = raw_bag_folder
-    elif bag_type == 'compressed':
-        filename = f"{compressed_bag_folder}/{time}_compressed.bag"
-        command = f"rosbag record -O {filename} /back_camera_image/compressed /front_camera_image/compressed"
-        record_location = compressed_bag_folder
-    elif bag_type == 'undistorted':
-        filename = f"{undistorted_bag_folder}/{time}_undistorted.bag"
-        command = f"rosbag record -O {filename} /back_camera_image/compressed /front_camera_image/compressed"
-        record_location = undistorted_bag_folder
-    else:
-        rospy.logerr('Invalid bag_type parameter.')
-        sys.exit(1)
-
-    # Register the signal handler for SIGINT (Ctrl + C)
-    signal.signal(signal.SIGINT, signal_handler)
-
-    rospy.logwarn(f"Recording to: {filename}")
-
-    # Start the recording process
-    process = subprocess.Popen(command, shell=True)
-
-    # Keep the node alive
-    rospy.spin()
+    main()

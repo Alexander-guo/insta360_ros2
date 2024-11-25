@@ -1,8 +1,0 @@
-<?xml version="1.0"?>
-<launch>
-    <arg name="config" default="config.yaml"/>
-
-    <rosparam file="$(find insta360_ros_driver)/config/$(arg config)" command="load"/>
-
-    <node name="undistortion_node" pkg="insta360_ros_driver" type="undistortion.py" output="screen"/>
-</launch>
