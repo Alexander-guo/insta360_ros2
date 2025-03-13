@@ -19,6 +19,7 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
 
+
 #include <atomic>
 #include <signal.h>
 
@@ -38,15 +39,57 @@ private:
     AVFrame* avFrame;
     AVPacket* pkt;
     struct SwsContext* img_convert_ctx;
+    
 
     std::shared_ptr<rclcpp::Node> node_;
-    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr dual_fisheye_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
+
+    double fx, fy, cx, cy;
+    std::vector<double> distCoeffs;
 
 public:
     TestStreamDelegate(const std::shared_ptr<rclcpp::Node>& node) : node_(node) {
-        image_pub_ = node_->create_publisher<sensor_msgs::msg::Image>("insta_image_yuv", rclcpp::QoS(0));
+        dual_fisheye_pub_ = node_->create_publisher<sensor_msgs::msg::Image>("/dual_fisheye/image", rclcpp::QoS(0));
         imu_pub_ = node_->create_publisher<sensor_msgs::msg::Imu>("imu/data_raw", rclcpp::QoS(0));
+
+        std::vector<double> default_K = {
+            254.875, 0.0, 480.00,
+            0.0, 254.875, 480.00,
+            0.0, 0.0, 1.0
+        };
+        std::vector<double> default_D = {0.082995, -0.027906, 0.0076202, -0.001083};
+
+        if (!node_->has_parameter("K")) {
+            node_->declare_parameter("K", default_K);
+        }
+        if (!node_->has_parameter("D")) {
+            node_->declare_parameter("D", default_D);
+        }
+
+        auto K = node_->get_parameter("K").as_double_array();
+        if (K.size() == 9) {
+            fx = K[0];
+            fy = K[4];
+            cx = K[2];
+            cy = K[5];
+            RCLCPP_INFO(node_->get_logger(), "Loaded camera matrix: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f", 
+                      fx, fy, cx, cy);
+        } else {
+            // Default values if parameters not found
+            fx = 254.875;
+            fy = 254.875;
+            cx = 480.00;
+            cy = 480.00;
+            RCLCPP_WARN(node_->get_logger(), "Using default camera parameters");
+        }
+        
+        distCoeffs = node_->get_parameter("D").as_double_array();
+        if (distCoeffs.empty()) {
+            distCoeffs = {0.082995, -0.027906, 0.0076202, -0.001083};
+            RCLCPP_WARN(node_->get_logger(), "Using default distortion coefficients");
+        }
+
         file1_ = fopen("./01.h264", "wb");
         file2_ = fopen("./02.h264", "wb");
         codec = avcodec_find_decoder(AV_CODEC_ID_H264);
@@ -54,6 +97,7 @@ public:
             std::cerr << "Codec not found\n";
             exit(1);
         }
+
         codecCtx = avcodec_alloc_context3(codec);
         codecCtx->flags2 |= AV_CODEC_FLAG2_FAST;
         if (!codecCtx) {
@@ -76,81 +120,81 @@ public:
         avcodec_free_context(&codecCtx);
     }
 
-    void OnAudioData(const uint8_t* data, size_t size, int64_t timestamp) override {
-        // std::cout << "on audio data:" << std::endl;
+    cv::Mat rotateImage(const cv::Mat& src, double angle) {
+        cv::Point2f center((src.cols-1)/2.0, (src.rows-1)/2.0);
+        cv::Mat rot = cv::getRotationMatrix2D(center, angle, 1.0);
+        cv::Mat dst;
+        cv::warpAffine(src, dst, rot, src.size());
+        return dst;
     }
 
-    void OnVideoData(const uint8_t* data, size_t size, int64_t timestamp, uint8_t streamType, int stream_index = 0) override {
-        if (stream_index == 0) {
-            pkt->data = const_cast<uint8_t*>(data);
-            pkt->size = size;
-            if (avcodec_send_packet(codecCtx, pkt) == 0) {
-                while (avcodec_receive_frame(codecCtx, avFrame) == 0) {
-                    int width = avFrame->width;
-                    int height = avFrame->height;
-                    // printf("width:%d height:%d\n", width, height);
-                    int chromaHeight = height / 2;
-                    int chromaWidth = width / 2;
-                    cv::Mat yuv(height + chromaHeight, width, CV_8UC1);
-                    memcpy(yuv.data, avFrame->data[0], width * height);
-                    memcpy(yuv.data + width * height, avFrame->data[1], chromaWidth * chromaHeight);
-                    memcpy(yuv.data + width * height + chromaWidth * chromaHeight, avFrame->data[2], chromaWidth * chromaHeight);
-                    cv::Mat rgb;
-                    cv::cvtColor(yuv, rgb, cv::COLOR_YUV420p2RGB);
-                    sensor_msgs::msg::Image msg;
-                    msg.header.stamp = node_->get_clock()->now();
-                    msg.header.frame_id = "camera_frame";
-                    msg.height = yuv.rows;
-                    msg.width = yuv.cols;
-                    msg.encoding = "8UC1";
-                    msg.is_bigendian = 0;
-                    msg.step = yuv.cols * yuv.elemSize();
-                    msg.data.assign(yuv.datastart, yuv.dataend);
-                    image_pub_->publish(msg);
-                    // sensor_msgs::msg::Image msg;
-                    // msg.header.stamp = node_->get_clock()->now();
-                    // msg.header.frame_id = "camera_frame";
-                    // msg.height = rgb.rows;
-                    // msg.width = rgb.cols;
-                    // msg.encoding = "rgb8";
-                    // msg.is_bigendian = 0;
-                    // msg.step = rgb.cols * rgb.elemSize();
-                    // msg.data.assign(rgb.datastart, rgb.dataend);
-                    // image_pub_->publish(msg);
-                }
-            }
-        }
+    sensor_msgs::msg::Image::SharedPtr matToImgMsg(const cv::Mat& image, const std::string& frame_id) {
+        auto img_msg = std::make_shared<sensor_msgs::msg::Image>();
+        img_msg->header.stamp = node_->get_clock()->now();
+        img_msg->header.frame_id = frame_id;
+        img_msg->height = image.rows;
+        img_msg->width = image.cols;
+        img_msg->encoding = "rgb8";
+        img_msg->is_bigendian = 0;
+        img_msg->step = image.cols * image.elemSize();
+        size_t size = img_msg->step * image.rows;
+        img_msg->data.resize(size);
+        memcpy(img_msg->data.data(), image.data, size);
+        return img_msg;
     }
 
     cv::Mat avframeToCvmat(const AVFrame *frame) {
         int width = frame->width;
         int height = frame->height;
         cv::Mat yuv(height + height / 2, width, CV_8UC1, frame->data[0]);
-        cv::Mat bgr;
-        cv::cvtColor(yuv, bgr, cv::COLOR_YUV420p2BGR);
-        return bgr;
+        cv::Mat rgb;
+        cv::cvtColor(yuv, rgb, cv::COLOR_YUV2RGB_I420);
+        return rgb;
+    }
+
+    void OnAudioData(const uint8_t* data, size_t size, int64_t timestamp) override {
+        // std::cout << "on audio data:" << std::endl;
+    }
+
+    void OnVideoData(const uint8_t* data, size_t size, int64_t timestamp, uint8_t streamType, int stream_index = 0) override {
+        if (stream_index == 0)
+        {
+            pkt->data = const_cast<uint8_t*>(data);
+            pkt->size = size;
+        }
+        if (avcodec_send_packet(codecCtx, pkt) == 0) {
+            while (avcodec_receive_frame(codecCtx, avFrame) == 0) {
+                int width = avFrame->width;
+                int height = avFrame->height;
+
+                int chromaHeight = height / 2;
+                int chromaWidth = width / 2;
+                cv::Mat yuv(height + chromaHeight, width, CV_8UC1);
+                memcpy(yuv.data, avFrame->data[0], width * height);
+                memcpy(yuv.data + width * height, avFrame->data[1], chromaWidth * chromaHeight);
+                memcpy(yuv.data + width * height + chromaWidth * chromaHeight, avFrame->data[2], chromaWidth * chromaHeight);
+
+                cv::Mat rgb;
+                cv::cvtColor(yuv, rgb, cv::COLOR_YUV2RGB_I420);
+
+                int midPoint = width / 2;
+                cv::Mat frontImage = rgb(cv::Rect(midPoint, 0, midPoint, height));
+                cv::Mat backImage = rgb(cv::Rect(0, 0, midPoint, height));
+
+                frontImage = rotateImage(frontImage, 90);
+                backImage = rotateImage(backImage, -90);
+
+                cv::Mat dualFisheyeImage;
+                cv::hconcat(frontImage, backImage, dualFisheyeImage);
+                
+                auto dualFisheyeMsg = matToImgMsg(dualFisheyeImage, "dual_fisheye_frame");
+                dual_fisheye_pub_->publish(*dualFisheyeMsg);
+            }
+        }
     }
 
     void OnGyroData(const std::vector<ins_camera::GyroData>& data) override {
         for (auto& gyro : data) {
-        	// if (gyro.timestamp - last_timestamp > 1) {
-        	// 	fprintf(file1_, "timestamp:%lld package_size = %d  offtimestamp = %lld gyro:[%f %f %f] accel:[%f %f %f]\n", gyro.timestamp, data.size(), gyro.timestamp - last_timestamp, gyro.gx, gyro.gy, gyro.gz, gyro.ax, gyro.ay, gyro.az);
-
-            //     printf("timestamp:%lld package_size = %d  offtimestamp = %lld gyro:[%f %f %f] accel:[%f %f %f]\n", gyro.timestamp, data.size(), gyro.timestamp - last_timestamp, gyro.gx, gyro.gy, gyro.gz, gyro.ax, gyro.ay, gyro.az);
-
-            //     sensor_msgs::msg::Imu msg;
-            //     msg.header.stamp = node_->get_clock()->now();
-            //     msg.header.frame_id = "odom";
-            //     msg.angular_velocity.x = gyro.gx;
-            //     msg.angular_velocity.y = gyro.gy;
-            //     msg.angular_velocity.z = gyro.gz;
-            //     msg.linear_acceleration.x = gyro.ax * 9.81;
-            //     msg.linear_acceleration.y = gyro.ay * 9.81;
-            //     msg.linear_acceleration.z = gyro.az * 9.81;
-            //     imu_pub_->publish(msg);
-        	// }
-        	// last_timestamp = gyro.timestamp;
-
             sensor_msgs::msg::Imu msg;
             msg.header.stamp = node_->get_clock()->now();
             msg.header.frame_id = "imu_frame";
@@ -209,9 +253,10 @@ public:
         auto start = time(NULL);
         cam->SyncLocalTimeToCamera(start);
         ins_camera::LiveStreamParam param;
-        param.video_resolution = ins_camera::VideoResolution::RES_2560_1280P30;
+        // param.video_resolution = ins_camera::VideoResolution::RES_2560_1280P30;
         // param.video_resolution = ins_camera::VideoResolution::RES_1152_1152P30;
-        param.video_bitrate = 1024 * 1024 * 50;
+        param.video_resolution = ins_camera::VideoResolution::RES_1920_960P30;
+        param.video_bitrate = 1024 * 1024 * 10;
         param.using_lrv = false;
         do {} while (!cam->StartLiveStreaming(param));
         std::cout << "successfully started live stream" << std::endl;

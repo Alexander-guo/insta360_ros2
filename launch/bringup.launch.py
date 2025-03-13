@@ -16,11 +16,13 @@ def generate_launch_description():
         default_value='false',
         description='Enable undistortion'
     )
-    get_images_arg = DeclareLaunchArgument(
-        'get_images',
-        default_value='false',
-        description='Enable image retrieval'
+
+    equirectangular_arg = DeclareLaunchArgument(
+        'equirectangular',
+        default_value='true',
+        description='Enable equirectangular projection'
     )
+
     config_arg = DeclareLaunchArgument(
         'config',
         default_value='config.yaml',
@@ -31,21 +33,7 @@ def generate_launch_description():
     bringup_node = Node(
         package='insta360_ros_driver',
         executable='insta360_ros_driver',
-        name='bringup',
-        parameters=[
-            PathJoinSubstitution([
-                FindPackageShare('insta360_ros_driver'),
-                'config',
-                LaunchConfiguration('config')
-            ])
-        ],
-        output='screen'
-    )
-
-    live_processing_node = Node(
-        package='insta360_ros_driver',
-        executable='live_processing.py',
-        name='live_processing',
+        name='insta360_bringup',
         parameters=[
             PathJoinSubstitution([
                 FindPackageShare('insta360_ros_driver'),
@@ -70,30 +58,23 @@ def generate_launch_description():
         ]
     )
 
-    # Define the get_images node
-    get_images_node = Node(
+    equirectangular_node = Node(
         package='insta360_ros_driver',
-        executable='get_images.py',
-        name='get_images',
+        executable='equirectangular.py',
+        name='equirectangular_node',
         output='screen',
-        parameters=[
-            {'topic': '/back_camera_image/compressed'}
-        ],
-        condition=IfCondition(LaunchConfiguration('get_images'))
+        condition=IfCondition(LaunchConfiguration('equirectangular')),
+        # arguments=['--gpu']
     )
 
-    # Create and populate the launch description
+
     ld = LaunchDescription()
 
-    # Add launch arguments
     ld.add_action(undistort_arg)
-    ld.add_action(get_images_arg)
     ld.add_action(config_arg)
-
-    # Add nodes to the launch description
+    ld.add_action(equirectangular_arg)
     ld.add_action(bringup_node)
-    ld.add_action(live_processing_node)
     ld.add_action(imu_node)
-    ld.add_action(get_images_node)
+    ld.add_action(equirectangular_node)
 
     return ld

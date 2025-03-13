@@ -1,0 +1,23 @@
+#config/calibration.yaml
+
+/**:
+  ros__parameters:
+    apply_changes: false
+    cx: 476.66470100570314
+    cy: 482.477893158099
+    equirect_height: 960
+    equirect_width: 1920
+    fx: 254.87597174247458
+    fy: 254.06164868269013
+    k1: 0.08
+    k2: -0.02
+    p1: 0.0
+    p2: -0.0
+    pitch: 0.0
+    reset_to_defaults: false
+    roll: 0.0
+    tx: -0.02
+    ty: 0.0
+    tz: -0.1
+    use_sim_time: false
+    yaw: 0.0

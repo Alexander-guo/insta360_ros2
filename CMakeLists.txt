@@ -58,11 +58,11 @@ install(TARGETS ${PROJECT_NAME}
 
 ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS
-  scripts/compression.py
-  scripts/undistortion.py
-  scripts/live_processing.py
-  scripts/get_images.py
-  scripts/record.py
+  scripts/undistort.py
+  scripts/equirectangular.py
+  scripts/offline_equirectangular.py
+  scripts/offline_calibration.py
+  scripts/webcam.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
