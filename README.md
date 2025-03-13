@@ -75,7 +75,7 @@ Whether to publish front and back rectilinear images
 
 The IMU allows for frame stabilization. For instance, you are able to visualize the orientation of the camera.
 
-https://github.com/user-attachments/assets/08f8cf72-9933-4614-bec8-e4f17c60f664
+![IMU](https://github.com/user-attachments/assets/02b50cad-8415-4dde-9014-9ab3a4d415b9)
 
 ## Star History
 
