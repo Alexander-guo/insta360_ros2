@@ -10,6 +10,10 @@ from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
+    pkg_dir = get_package_share_directory('insta360_ros_driver')
+    extrinsics = os.path.join(pkg_dir, 'config', 'extrinsics.json')
+    intrinsics = os.path.join(pkg_dir, 'config', 'intrinsics.yaml')
+
     # Declare launch arguments
     undistort_arg = DeclareLaunchArgument(
         'undistort',
@@ -64,7 +68,18 @@ def generate_launch_description():
         name='equirectangular_node',
         output='screen',
         condition=IfCondition(LaunchConfiguration('equirectangular')),
-        # arguments=['--gpu']
+        arguments=[
+            '--gpu',
+            '--calibration_file', extrinsics]
+    )
+
+    undistort_node = Node(
+        package='insta360_ros_driver',
+        executable='undistort.py',
+        name='undistort_node',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('undistort')),
+        parameters=[intrinsics]
     )
 
 
@@ -76,5 +91,6 @@ def generate_launch_description():
     ld.add_action(bringup_node)
     ld.add_action(imu_node)
     ld.add_action(equirectangular_node)
+    ld.add_action(undistort_node)
 
     return ld

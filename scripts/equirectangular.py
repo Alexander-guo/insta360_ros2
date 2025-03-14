@@ -29,7 +29,7 @@ def parse_args():
 
     parser = argparse.ArgumentParser(description='Convert dual fisheye images to equirectangular format')
     parser.add_argument('--calibrate', action='store_true', help='Enable calibration mode')
-    parser.add_argument('--calibration_file', type=str, default='/home/abanesjo/ros2_ws/src/Triton/dependencies/insta360_ros_driver/config/calibration.json', help='Path to calibration JSON file')
+    parser.add_argument('--calibration_file', type=str, default='/home/abanesjo/ros2_ws/src/Triton/dependencies/insta360_ros_driver/config/extrinsics.json', help='Path to calibration JSON file')
     parser.add_argument('--gpu', action='store_true', help='Use GPU acceleration for equirectangular projection')
     
     # Parse only non-ROS arguments
