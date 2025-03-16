@@ -11,7 +11,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     pkg_dir = get_package_share_directory('insta360_ros_driver')
-    extrinsics = os.path.join(pkg_dir, 'config', 'extrinsics.json')
+    extrinsics = os.path.join(pkg_dir, 'config', 'extrinsics_x2.json')
     intrinsics = os.path.join(pkg_dir, 'config', 'intrinsics.yaml')
 
     # Declare launch arguments

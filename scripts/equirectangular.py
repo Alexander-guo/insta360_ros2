@@ -37,7 +37,7 @@ def parse_args():
 
 
 class EquirectangularNode(Node):
-    def __init__(self, enable_calibration=False, calibration_file='calibration.json', use_gpu=False):
+    def __init__(self, enable_calibration=False, calibration_file='extrinsics.json', use_gpu=False):
         super().__init__('equirectangular_node')
 
         self.params_changed = True
@@ -732,7 +732,7 @@ def main(args=None):
     # Process arguments regardless of launch method
     enable_calibration = '--calibrate' in sys.argv
     use_gpu = '--gpu' in sys.argv
-    calibration_file = '/home/abanesjo/ros2_ws/src/Triton/dependencies/insta360_ros_driver/config/calibration.json'
+    calibration_file = '/home/abanesjo/ros2_ws/src/Triton/dependencies/insta360_ros_driver/config/extrinsics_air.json'
     
     # Check for custom calibration file
     for i, arg in enumerate(sys.argv[1:-1], 1):

@@ -53,43 +53,6 @@ public:
         dual_fisheye_pub_ = node_->create_publisher<sensor_msgs::msg::Image>("/dual_fisheye/image", rclcpp::QoS(0));
         imu_pub_ = node_->create_publisher<sensor_msgs::msg::Imu>("imu/data_raw", rclcpp::QoS(0));
 
-        std::vector<double> default_K = {
-            254.875, 0.0, 480.00,
-            0.0, 254.875, 480.00,
-            0.0, 0.0, 1.0
-        };
-        std::vector<double> default_D = {0.082995, -0.027906, 0.0076202, -0.001083};
-
-        if (!node_->has_parameter("K")) {
-            node_->declare_parameter("K", default_K);
-        }
-        if (!node_->has_parameter("D")) {
-            node_->declare_parameter("D", default_D);
-        }
-
-        auto K = node_->get_parameter("K").as_double_array();
-        if (K.size() == 9) {
-            fx = K[0];
-            fy = K[4];
-            cx = K[2];
-            cy = K[5];
-            RCLCPP_INFO(node_->get_logger(), "Loaded camera matrix: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f", 
-                      fx, fy, cx, cy);
-        } else {
-            // Default values if parameters not found
-            fx = 254.875;
-            fy = 254.875;
-            cx = 480.00;
-            cy = 480.00;
-            RCLCPP_WARN(node_->get_logger(), "Using default camera parameters");
-        }
-        
-        distCoeffs = node_->get_parameter("D").as_double_array();
-        if (distCoeffs.empty()) {
-            distCoeffs = {0.082995, -0.027906, 0.0076202, -0.001083};
-            RCLCPP_WARN(node_->get_logger(), "Using default distortion coefficients");
-        }
-
         file1_ = fopen("./01.h264", "wb");
         file2_ = fopen("./02.h264", "wb");
         codec = avcodec_find_decoder(AV_CODEC_ID_H264);

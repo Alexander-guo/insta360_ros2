@@ -15,10 +15,12 @@ class WebcamPublisher(Node):
         super().__init__('webcam_publisher')
 
         # Declare parameters
-        self.declare_parameter('camera_index', 4)
+        self.declare_parameter('camera_index', 5)
         self.declare_parameter('frame_rate', 30.0)
-        self.declare_parameter('width', 2176)
-        self.declare_parameter('height', 1088)
+        # self.declare_parameter('width', 2176)
+        # self.declare_parameter('height', 1088)
+        self.declare_parameter('width', 1472)
+        self.declare_parameter('height', 736)
 
         # Get parameters
         self.camera_index = self.get_parameter('camera_index').value
