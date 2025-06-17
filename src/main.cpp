@@ -1,173 +1,86 @@
 #include <iostream>
 #include <thread>
-#include <regex>
-#include <opencv2/opencv.hpp>
+#include <string>
+#include <vector>
+#include <atomic>
 
-#include "camera/camera.h"
-#include "camera/photography_settings.h"
-#include "camera/device_discovery.h"
-#include "camera/ins_types.h"
-
-#include "stream/stream_delegate.h"
-#include "stream/stream_types.h"
+#include <camera/camera.h>
+#include <camera/photography_settings.h>
+#include <camera/device_discovery.h>
 
 #include "rclcpp/rclcpp.hpp"
-#include "sensor_msgs/msg/image.hpp"
+#include "rclcpp/qos.hpp"
+#include "sensor_msgs/msg/compressed_image.hpp"
 #include "sensor_msgs/msg/imu.hpp"
-#include "cv_bridge/cv_bridge.h"
-#include "sensor_msgs/image_encodings.hpp"
-#include <opencv2/imgproc/imgproc.hpp>
-#include <opencv2/highgui/highgui.hpp>
-
-
-#include <atomic>
-#include <signal.h>
-
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavutil/imgutils.h>
-#include <libswscale/swscale.h>
-}
 
 class TestStreamDelegate : public ins_camera::StreamDelegate {
 private:
-    FILE* file1_;
-    FILE* file2_;
-    int64_t last_timestamp = 0;
-    AVCodec* codec;
-    AVCodecContext* codecCtx;
-    AVFrame* avFrame;
-    AVPacket* pkt;
-    struct SwsContext* img_convert_ctx;
-    
-
     std::shared_ptr<rclcpp::Node> node_;
-    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr dual_fisheye_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
-
-    double fx, fy, cx, cy;
-    std::vector<double> distCoeffs;
 
 public:
     TestStreamDelegate(const std::shared_ptr<rclcpp::Node>& node) : node_(node) {
-        dual_fisheye_pub_ = node_->create_publisher<sensor_msgs::msg::Image>("/dual_fisheye/image", rclcpp::QoS(0));
-        imu_pub_ = node_->create_publisher<sensor_msgs::msg::Imu>("imu/data_raw", rclcpp::QoS(0));
+        // Publisher for the compressed H.264 video stream
+        compressed_pub_ = node_->create_publisher<sensor_msgs::msg::CompressedImage>(
+            "/dual_fisheye/image/compressed", 
+            rclcpp::QoS(10)
+        );
 
-        file1_ = fopen("./01.h264", "wb");
-        file2_ = fopen("./02.h264", "wb");
-        codec = avcodec_find_decoder(AV_CODEC_ID_H264);
-        if (!codec) {
-            std::cerr << "Codec not found\n";
-            exit(1);
-        }
-
-        codecCtx = avcodec_alloc_context3(codec);
-        codecCtx->flags2 |= AV_CODEC_FLAG2_FAST;
-        if (!codecCtx) {
-            std::cerr << "Could not allocate video codec context\n";
-            exit(1);
-        }
-        if (avcodec_open2(codecCtx, codec, nullptr) < 0) {
-            std::cerr << "Could not open codec\n";
-            exit(1);
-        }
-        avFrame = av_frame_alloc();
-        pkt = av_packet_alloc();
+        // Publisher for IMU data (remains the same)
+        imu_pub_ = node_->create_publisher<sensor_msgs::msg::Imu>("imu/data_raw", rclcpp::SensorDataQoS());
+        RCLCPP_INFO(node_->get_logger(), "Publisher for compressed images and IMU created.");
     }
 
-    ~TestStreamDelegate() {
-        fclose(file1_);
-        fclose(file2_);
-        av_frame_free(&avFrame);
-        av_packet_free(&pkt);
-        avcodec_free_context(&codecCtx);
-    }
+    virtual ~TestStreamDelegate() {}
 
-    cv::Mat rotateImage(const cv::Mat& src, double angle) {
-        cv::Point2f center((src.cols-1)/2.0, (src.rows-1)/2.0);
-        cv::Mat rot = cv::getRotationMatrix2D(center, angle, 1.0);
-        cv::Mat dst;
-        cv::warpAffine(src, dst, rot, src.size());
-        return dst;
-    }
+    void OnAudioData(const uint8_t* data, size_t size, int64_t timestamp) override {}
 
-    sensor_msgs::msg::Image::SharedPtr matToImgMsg(const cv::Mat& image, const std::string& frame_id) {
-        auto img_msg = std::make_shared<sensor_msgs::msg::Image>();
-        img_msg->header.stamp = node_->get_clock()->now();
-        img_msg->header.frame_id = frame_id;
-        img_msg->height = image.rows;
-        img_msg->width = image.cols;
-        img_msg->encoding = "rgb8";
-        img_msg->is_bigendian = 0;
-        img_msg->step = image.cols * image.elemSize();
-        size_t size = img_msg->step * image.rows;
-        img_msg->data.resize(size);
-        memcpy(img_msg->data.data(), image.data, size);
-        return img_msg;
-    }
+    void OnVideoData(const uint8_t* data, size_t size, int64_t timestamp, uint8_t streamType, int stream_index) override {
+        // We only care about the main video stream (index 0)
+        if (stream_index == 0 && size > 0 && compressed_pub_) {
+            auto msg = std::make_unique<sensor_msgs::msg::CompressedImage>();
 
-    cv::Mat avframeToCvmat(const AVFrame *frame) {
-        int width = frame->width;
-        int height = frame->height;
-        cv::Mat yuv(height + height / 2, width, CV_8UC1, frame->data[0]);
-        cv::Mat rgb;
-        cv::cvtColor(yuv, rgb, cv::COLOR_YUV2RGB_I420);
-        return rgb;
-    }
+            // Set the header
+            msg->header.stamp = node_->get_clock()->now();
+            msg->header.frame_id = "camera_frame";
 
-    void OnAudioData(const uint8_t* data, size_t size, int64_t timestamp) override {
-        // std::cout << "on audio data:" << std::endl;
-    }
+            // Set the format to H.264
+            // The subscriber will need to know this to select the correct decoder.
+            msg->format = "h264";
 
-    void OnVideoData(const uint8_t* data, size_t size, int64_t timestamp, uint8_t streamType, int stream_index = 0) override {
-        if (stream_index == 0)
-        {
-            pkt->data = const_cast<uint8_t*>(data);
-            pkt->size = size;
-        }
-        if (avcodec_send_packet(codecCtx, pkt) == 0) {
-            while (avcodec_receive_frame(codecCtx, avFrame) == 0) {
-                int width = avFrame->width;
-                int height = avFrame->height;
+            // Copy the compressed video data directly into the message
+            msg->data.assign(data, data + size);
 
-                int chromaHeight = height / 2;
-                int chromaWidth = width / 2;
-                cv::Mat yuv(height + chromaHeight, width, CV_8UC1);
-                memcpy(yuv.data, avFrame->data[0], width * height);
-                memcpy(yuv.data + width * height, avFrame->data[1], chromaWidth * chromaHeight);
-                memcpy(yuv.data + width * height + chromaWidth * chromaHeight, avFrame->data[2], chromaWidth * chromaHeight);
-
-                cv::Mat rgb;
-                cv::cvtColor(yuv, rgb, cv::COLOR_YUV2RGB_I420);
-
-                int midPoint = width / 2;
-                cv::Mat frontImage = rgb(cv::Rect(midPoint, 0, midPoint, height));
-                cv::Mat backImage = rgb(cv::Rect(0, 0, midPoint, height));
-
-                frontImage = rotateImage(frontImage, 90);
-                backImage = rotateImage(backImage, -90);
-
-                cv::Mat dualFisheyeImage;
-                cv::hconcat(frontImage, backImage, dualFisheyeImage);
-                
-                auto dualFisheyeMsg = matToImgMsg(dualFisheyeImage, "dual_fisheye_frame");
-                dual_fisheye_pub_->publish(*dualFisheyeMsg);
-            }
+            compressed_pub_->publish(std::move(msg));
         }
     }
 
     void OnGyroData(const std::vector<ins_camera::GyroData>& data) override {
-        for (auto& gyro : data) {
-            sensor_msgs::msg::Imu msg;
-            msg.header.stamp = node_->get_clock()->now();
-            msg.header.frame_id = "imu_frame";
-            msg.angular_velocity.x = gyro.gx;
-            msg.angular_velocity.y = gyro.gy;
-            msg.angular_velocity.z = gyro.gz;
-            msg.linear_acceleration.x = gyro.ax * 9.81;
-            msg.linear_acceleration.y = gyro.ay * 9.81;
-            msg.linear_acceleration.z = gyro.az * 9.81;
-            imu_pub_->publish(msg);
+        for (const auto& gyro : data) {
+            auto msg = std::make_unique<sensor_msgs::msg::Imu>();
+            msg->header.stamp = node_->get_clock()->now();
+            msg->header.frame_id = "imu_frame";
+            msg->angular_velocity.x = gyro.gx;
+            msg->angular_velocity.y = gyro.gy;
+            msg->angular_velocity.z = gyro.gz;
+            
+            msg->linear_acceleration.x = gyro.ax * 9.80665;
+            msg->linear_acceleration.y = gyro.ay * 9.80665;
+            msg->linear_acceleration.z = gyro.az * 9.80665;
+
+            msg->orientation.x = 0.0;
+            msg->orientation.y = 0.0;
+            msg->orientation.z = 0.0;
+            msg->orientation.w = 1.0; // Neutral orientation
+            msg->orientation_covariance[0] = -1.0; // No orientation data available
+
+            for (int i = 0; i < 9; i++)
+            {
+                msg->angular_velocity_covariance[i] = 0;
+                msg->linear_acceleration_covariance[i] = 0;
+            }
+            imu_pub_->publish(std::move(msg));
         }
     }
 
@@ -180,61 +93,63 @@ private:
     std::shared_ptr<rclcpp::Node> node_;
 
 public:
-    CameraWrapper(const std::shared_ptr<rclcpp::Node>& node) : node_(node) {
-        RCLCPP_ERROR(node_->get_logger(), "Opened Camera");
-    }
+    CameraWrapper(const std::shared_ptr<rclcpp::Node>& node) : node_(node) {}
 
     ~CameraWrapper() {
-        RCLCPP_ERROR(node_->get_logger(), "Closing Camera");
-        cam->Close();
+        if (cam) {
+            cam->Close();
+        }
     }
 
     int run_camera() {
         ins_camera::DeviceDiscovery discovery;
         auto list = discovery.GetAvailableDevices();
-        for (int i = 0; i < list.size(); ++i) {
-            auto desc = list[i];
-            std::cout << "serial:" << desc.serial_number << "\t"
-                << "camera type:" << int(desc.camera_type) << "\t"
-                << "lens type:" << int(desc.lens_type) << std::endl;
-        }
-        if (list.size() <= 0) {
-            std::cerr << "no device found." << std::endl;
+        if (list.empty()) {
+            RCLCPP_ERROR(node_->get_logger(), "No available camera devices found.");
             return -1;
         }
+
         cam = std::make_shared<ins_camera::Camera>(list[0].info);
         if (!cam->Open()) {
-            std::cerr << "failed to open camera" << std::endl;
+            RCLCPP_ERROR(node_->get_logger(), "Failed to open camera.");
             return -1;
         }
-        std::cout << "http base url:" << cam->GetHttpBaseUrl() << std::endl;
+        RCLCPP_INFO(node_->get_logger(), "Camera opened successfully.");
+        discovery.FreeDeviceDescriptors(list);
+
         std::shared_ptr<ins_camera::StreamDelegate> delegate = std::make_shared<TestStreamDelegate>(node_);
         cam->SetStreamDelegate(delegate);
-        discovery.FreeDeviceDescriptors(list);
-        std::cout << "Successfully opened camera..." << std::endl;
-        auto camera_type = cam->GetCameraType();
+
         auto start = time(NULL);
-        cam->SyncLocalTimeToCamera(start);
+        cam->SyncLocalTimeToCamera(start);        
         ins_camera::LiveStreamParam param;
-        // param.video_resolution = ins_camera::VideoResolution::RES_2560_1280P30;
-        // param.video_resolution = ins_camera::VideoResolution::RES_1152_1152P30;
-        param.video_resolution = ins_camera::VideoResolution::RES_1920_960P30;
-        param.video_bitrate = 1024 * 1024 * 10;
+        param.video_resolution = ins_camera::VideoResolution::RES_3840_1920P30;
+        param.lrv_video_resulution = ins_camera::VideoResolution::RES_1440_720P30;
+        param.video_bitrate = 1024 * 1024 / 2;
+        param.enable_audio = false;
         param.using_lrv = false;
-        do {} while (!cam->StartLiveStreaming(param));
-        std::cout << "successfully started live stream" << std::endl;
+
+        if (!cam->StartLiveStreaming(param)) {
+            RCLCPP_ERROR(node_->get_logger(), "Failed to start live streaming.");
+            return -1;
+        }
+        
+        RCLCPP_INFO(node_->get_logger(), "Live streaming started.");
         return 0;
     }
 };
 
 int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
-    auto node = rclcpp::Node::make_shared("insta");
-    {
-        CameraWrapper camera(node);
-        camera.run_camera();
-        rclcpp::spin(node);
+    auto node = rclcpp::Node::make_shared("insta_publisher");
+    
+    CameraWrapper camera(node);
+    if (camera.run_camera() != 0) {
+        rclcpp::shutdown();
+        return -1;
     }
+    
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }
