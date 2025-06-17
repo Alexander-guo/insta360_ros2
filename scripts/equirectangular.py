@@ -140,7 +140,24 @@ class EquirectangularNode(Node):
                     math.degrees(self.yaw)
                 ])
             ])
-            self.get_logger().info("Parameters saved to ROS parameter server")
+            
+            # Print parameters in YAML format for copy-pasting
+            print("\n" + "="*50)
+            print("CALIBRATION PARAMETERS (YAML FORMAT)")
+            print("="*50)
+            print("equirectangular_node:")
+            print("  ros__parameters:")
+            print(f"    cx_offset: {self.cx_offset}")
+            print(f"    cy_offset: {self.cy_offset}")
+            print(f"    crop_size: {self.crop_size}")
+            print(f"    translation: [{self.tx}, {self.ty}, {self.tz}]")
+            print(f"    rotation_deg: [{math.degrees(self.roll)}, {math.degrees(self.pitch)}, {math.degrees(self.yaw)}]")
+            print(f"    gpu: {self.gpu_enabled}")
+            print(f"    out_width: {self.out_width}")
+            print(f"    out_height: {self.out_height}")
+            print("="*50 + "\n")
+            
+            self.get_logger().info("Parameters saved to ROS parameter server and printed above")
             return True
         except Exception as e:
             self.get_logger().error(f"Error saving parameters: {e}")
