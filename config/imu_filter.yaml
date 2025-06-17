@@ -4,10 +4,10 @@ imu_filter:
     use_mag: false
     publish_tf: true
     reverse_tf: false
-    fixed_frame: "base_footprint"
+    fixed_frame: "imu_stabilized"
     constant_dt: 0.0
     publish_debug_topics: false
-    world_frame: "enu"
+    world_frame: "nwu"
     gain: 0.1
     zeta: 0.0
     mag_bias_x: 0.0

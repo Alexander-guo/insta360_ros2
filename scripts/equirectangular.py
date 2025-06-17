@@ -11,39 +11,36 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import math
-import os
-import json
 from rcl_interfaces.msg import SetParametersResult
-import argparse
-
-
-def parse_args():
-    # Filter out ros arguments before parsing
-    ros_args = []
-    regular_args = []
-    for arg in sys.argv[1:]:
-        if arg.startswith('--ros-args') or arg.startswith('-r'):
-            ros_args.append(arg)
-        else:
-            regular_args.append(arg)
-
-    parser = argparse.ArgumentParser(description='Convert dual fisheye images to equirectangular format')
-    parser.add_argument('--calibrate', action='store_true', help='Enable calibration mode')
-    parser.add_argument('--calibration_file', type=str, default='/home/triton/ros2_ws/src/Triton/dependencies/insta360_ros_driver/config/extrinsics_x2.json', help='Path to calibration JSON file')
-    parser.add_argument('--gpu', action='store_true', help='Use GPU acceleration for equirectangular projection')
-    
-    # Parse only non-ROS arguments
-    return parser.parse_args(regular_args)
 
 
 class EquirectangularNode(Node):
-    def __init__(self, enable_calibration=False, calibration_file='extrinsics.json', use_gpu=False):
+    def __init__(self, enable_calibration=False):
         super().__init__('equirectangular_node')
 
         self.params_changed = True
         
-        self.use_cuda = torch.cuda.is_available() and use_gpu
-        self.get_logger().info(f"GPU acceleration: requested={use_gpu}, available={torch.cuda.is_available()}, using={self.use_cuda}")
+        # Declare parameters with default values from YAML
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('cx_offset', 0.0),
+                ('cy_offset', 0.0),
+                ('crop_size', 960),
+                ('translation', [0.0, 0.0, -0.105]),
+                ('rotation_deg', [-0.5, 0.0, 1.1]),
+                ('gpu', True),
+                ('out_width', 1920),
+                ('out_height', 960)
+            ]
+        )
+        
+        # Load parameters from ROS parameter server
+        self.load_parameters()
+        
+        # Initialize GPU settings
+        self.use_cuda = torch.cuda.is_available() and self.gpu_enabled
+        self.get_logger().info(f"GPU acceleration: requested={self.gpu_enabled}, available={torch.cuda.is_available()}, using={self.use_cuda}")
         self.device = torch.device('cuda' if self.use_cuda else 'cpu')
 
         self.calibration_mode = enable_calibration
@@ -71,44 +68,11 @@ class EquirectangularNode(Node):
         self.back_grid: torch.Tensor | None = None
         self.front_mask_gpu: torch.Tensor | None = None
         self.back_mask_gpu: torch.Tensor | None = None
-        self.edge_mask_gpu: torch.Tensor | None = None # Retained if used elsewhere, otherwise can be removed
-        self.blend_weight_gpu: torch.Tensor | None = None # Retained if used elsewhere
-        
-        # Default parameter values
-        self.cx_offset: float = 0.0
-        self.cy_offset: float = 0.0
-        self.crop_size: int = 960
-        self.tx: float = 0.0
-        self.ty: float = 0.0
-        self.tz: float = 0.0
-        self.roll: float = 0.0
-        self.pitch: float = 0.0
-        self.yaw: float = math.radians(90.0) # Initialize in radians
-        self.out_width: int = 1920
-        self.out_height: int = 960
-        
-        self.calibration_file = calibration_file
-        self.load_calibration() # Load calibration before declaring parameters to use loaded values as defaults
-        
-        self.declare_parameters(
-            namespace='',
-            parameters=[
-                ('cx_offset', self.cx_offset),
-                ('cy_offset', self.cy_offset),
-                ('crop_size', self.crop_size),
-                ('tx', self.tx),
-                ('ty', self.ty),
-                ('tz', self.tz),
-                ('roll', self.roll),
-                ('pitch', self.pitch),
-                ('yaw', self.yaw),
-                ('out_width', self.out_width),
-                ('out_height', self.out_height)
-            ]
-        )
+        self.edge_mask_gpu: torch.Tensor | None = None
+        self.blend_weight_gpu: torch.Tensor | None = None
         
         self.add_on_set_parameters_callback(self.parameters_callback)
-        self.update_camera_parameters() # Read initial parameters after declaration
+        self.update_camera_parameters() # Initialize camera parameters
         
         self.bridge = CvBridge()
         
@@ -127,61 +91,49 @@ class EquirectangularNode(Node):
             self.get_logger().info("Calibration mode enabled")
             self.setup_calibration_ui()
     
-    def load_calibration(self):
-        """Load calibration parameters from JSON file"""
-        if not os.path.isfile(self.calibration_file):
-            self.get_logger().warn(f"Calibration file not found: {self.calibration_file}")
-            return False
+    def load_parameters(self):
+        """Load parameters from ROS parameter server"""
+        self.cx_offset = self.get_parameter('cx_offset').get_parameter_value().double_value
+        self.cy_offset = self.get_parameter('cy_offset').get_parameter_value().double_value
+        self.crop_size = self.get_parameter('crop_size').get_parameter_value().integer_value
+        self.out_width = self.get_parameter('out_width').get_parameter_value().integer_value
+        self.out_height = self.get_parameter('out_height').get_parameter_value().integer_value
+        self.gpu_enabled = self.get_parameter('gpu').get_parameter_value().bool_value
         
-        try:
-            with open(self.calibration_file, 'r') as f:
-                params = json.load(f)
-            
-            self.cx_offset = params.get('cx_offset', self.cx_offset)
-            self.cy_offset = params.get('cy_offset', self.cy_offset)
-            self.crop_size = params.get('crop_size', self.crop_size)
-            
-            translation = params.get('translation', [self.tx, self.ty, self.tz])
-            self.tx, self.ty, self.tz = translation
-            
-            rotation_deg = params.get('rotation_deg', [0.0, 0.0, 0.0])
-            self.roll = math.radians(rotation_deg[0])
-            self.pitch = math.radians(rotation_deg[1])
-            self.yaw = math.radians(rotation_deg[2])
-            
-            self.get_logger().info(f"Loaded calibration parameters from {self.calibration_file}")
-            self.get_logger().info(f"  Crop size: {self.crop_size}")
-            self.get_logger().info(f"  Center offset: ({self.cx_offset}, {self.cy_offset})")
-            self.get_logger().info(f"  Translation: [{self.tx}, {self.ty}, {self.tz}]")
-            self.get_logger().info(f"  Rotation (deg): {rotation_deg}")
-            
-            return True
-        except Exception as e:
-            self.get_logger().error(f"Error loading calibration file: {e}")
-            return False
+        translation = self.get_parameter('translation').get_parameter_value().double_array_value
+        self.tx, self.ty, self.tz = translation
+        
+        rotation_deg = self.get_parameter('rotation_deg').get_parameter_value().double_array_value
+        self.roll = math.radians(rotation_deg[0])
+        self.pitch = math.radians(rotation_deg[1])
+        self.yaw = math.radians(rotation_deg[2])
+        
+        self.get_logger().info(f"Loaded parameters from ROS parameter server")
+        self.get_logger().info(f"  Crop size: {self.crop_size}")
+        self.get_logger().info(f"  Center offset: ({self.cx_offset}, {self.cy_offset})")
+        self.get_logger().info(f"  Translation: [{self.tx}, {self.ty}, {self.tz}]")
+        self.get_logger().info(f"  Rotation (deg): {rotation_deg}")
+        self.get_logger().info(f"  Output size: {self.out_width}x{self.out_height}")
+        self.get_logger().info(f"  GPU enabled: {self.gpu_enabled}")
     
     def save_calibration(self):
-        """Save current calibration parameters to JSON file"""
-        params = {
-            'cx_offset': self.cx_offset,
-            'cy_offset': self.cy_offset,
-            'crop_size': self.crop_size,
-            'translation': [self.tx, self.ty, self.tz],
-            'rotation_deg': [
-                math.degrees(self.roll),
-                math.degrees(self.pitch),
-                math.degrees(self.yaw)
-            ]
-        }
-        
+        """Save current calibration parameters to ROS parameter server"""
         try:
-            with open(self.calibration_file, 'w') as f:
-                json.dump(params, f, indent=2)
-                
-            self.get_logger().info(f"Parameters saved to {self.calibration_file}")
+            self.set_parameters([
+                Parameter('cx_offset', Parameter.Type.DOUBLE, self.cx_offset),
+                Parameter('cy_offset', Parameter.Type.DOUBLE, self.cy_offset),
+                Parameter('crop_size', Parameter.Type.INTEGER, self.crop_size),
+                Parameter('translation', Parameter.Type.DOUBLE_ARRAY, [self.tx, self.ty, self.tz]),
+                Parameter('rotation_deg', Parameter.Type.DOUBLE_ARRAY, [
+                    math.degrees(self.roll),
+                    math.degrees(self.pitch),
+                    math.degrees(self.yaw)
+                ])
+            ])
+            self.get_logger().info("Parameters saved to ROS parameter server")
             return True
         except Exception as e:
-            self.get_logger().error(f"Error saving calibration file: {e}")
+            self.get_logger().error(f"Error saving parameters: {e}")
             return False
 
     def parameters_callback(self, params):
@@ -190,11 +142,12 @@ class EquirectangularNode(Node):
         
         for param in params:
             # Check if a camera parameter was changed
-            if param.name in ['cx_offset', 'cy_offset', 'crop_size', 'tx', 'ty', 'tz',
-                             'roll', 'pitch', 'yaw', 'out_width', 'out_height']:
+            if param.name in ['cx_offset', 'cy_offset', 'crop_size', 'translation', 'rotation_deg',
+                             'out_width', 'out_height', 'gpu']:
                 update_needed = True
                 
         if update_needed:
+            self.load_parameters()
             self.update_camera_parameters()
             
         return SetParametersResult(successful=True)
@@ -216,41 +169,7 @@ class EquirectangularNode(Node):
         cv2.setTrackbarPos("Yaw [-180°,180°]", self.control_window, int(math.degrees(self.yaw) * 10) + 1800)
 
     def update_camera_parameters(self):
-        # Do not re-read cx_offset and cy_offset so they remain as set by the UI.
-        # self.cx_offset = self.get_parameter('cx_offset').value
-        # self.cy_offset = self.get_parameter('cy_offset').value
-
-        # For parameters controlled by UI trackbars (crop_size, tx, ty, tz, roll, pitch, yaw),
-        # their instance variables are updated directly by their respective callbacks.
-        # We avoid re-reading them from self.get_parameter() here to prevent using a
-        # potentially stale value if the ROS parameter service hasn't processed the update yet.
-        # self.crop_size = self.get_parameter('crop_size').value # Updated by update_crop callback
-        
-        # Read and cast out_width and out_height
-        out_width_param = self.get_parameter('out_width')
-        if out_width_param.value is not None:
-            self.out_width = int(out_width_param.value)
-        else:
-            self.get_logger().warn("out_width parameter is None, using default or previous value if available.")
-            if not hasattr(self, 'out_width') or self.out_width is None: # Ensure it has some value
-                 self.out_width = 1920 # Default fallback
-
-        out_height_param = self.get_parameter('out_height')
-        if out_height_param.value is not None:
-            self.out_height = int(out_height_param.value)
-        else:
-            self.get_logger().warn("out_height parameter is None, using default or previous value if available.")
-            if not hasattr(self, 'out_height') or self.out_height is None: # Ensure it has some value
-                self.out_height = 960 # Default fallback
-
-        # self.tx = self.get_parameter('tx').value # Updated by update_tx callback
-        # self.ty = self.get_parameter('ty').value # Updated by update_ty callback
-        # self.tz = self.get_parameter('tz').value # Updated by update_tz callback
-        # self.roll = self.get_parameter('roll').value # Updated by update_roll callback
-        # self.pitch = self.get_parameter('pitch').value # Updated by update_pitch callback
-        # self.yaw = self.get_parameter('yaw').value # Updated by update_yaw callback
-
-        # Rebuild the rotation matrix etc. as before, using the current instance variables
+        # Build rotation matrix using current parameters
         Rx = torch.tensor([
             [1.0, 0.0, 0.0],
             [0.0, math.cos(self.roll), -math.sin(self.roll)],
@@ -311,7 +230,7 @@ class EquirectangularNode(Node):
         
         r_front = torch.sqrt(X[self.front_mask]**2 + Y[self.front_mask]**2).clamp_(min=1e-6)
         theta_front = torch.atan2(r_front, torch.abs(Z[self.front_mask]))
-        r_fisheye_front = 2 * theta_front / math.pi * (self.img_width / 2) # Use self.img_width
+        r_fisheye_front = 2 * theta_front / math.pi * (self.img_width / 2)
         
         self.front_map_x = torch.zeros((self.out_height, self.out_width), dtype=torch.float32, device=self.device)
         self.front_map_y = torch.zeros((self.out_height, self.out_width), dtype=torch.float32, device=self.device)
@@ -336,7 +255,7 @@ class EquirectangularNode(Node):
         
         r_back = torch.sqrt(X_back**2 + Y_back**2).clamp_(min=1e-6)
         theta_back = torch.atan2(r_back, torch.abs(Z_back))
-        r_fisheye_back = 2 * theta_back / math.pi * (self.img_width / 2) # Use self.img_width
+        r_fisheye_back = 2 * theta_back / math.pi * (self.img_width / 2)
         
         self.back_map_x = torch.zeros((self.out_height, self.out_width), dtype=torch.float32, device=self.device)
         self.back_map_y = torch.zeros((self.out_height, self.out_width), dtype=torch.float32, device=self.device)
@@ -349,7 +268,7 @@ class EquirectangularNode(Node):
         self.back_map_x_np = self.back_map_x.cpu().numpy()
         self.back_map_y_np = self.back_map_y.cpu().numpy()
         
-        if self.front_mask_np is not None: # self.blend_kernel is pre-initialized
+        if self.front_mask_np is not None:
             front_mask_uint8 = self.front_mask_np.astype(np.uint8)
             self.front_edge = cv2.dilate(front_mask_uint8, self.blend_kernel, iterations=2) - \
                               cv2.erode(front_mask_uint8, self.blend_kernel, iterations=2)
@@ -362,7 +281,7 @@ class EquirectangularNode(Node):
             try:
                 if self.img_width is None or self.img_height is None: 
                     self.get_logger().error("Image dimensions (img_width, img_height) are None. Cannot initialize GPU grids.")
-                    self.use_cuda = False # Fallback if critical dimensions are missing
+                    self.use_cuda = False
                 else:
                     front_map_x_norm = 2.0 * (self.front_map_x / self.img_width) - 1.0
                     front_map_y_norm = 2.0 * (self.front_map_y / self.img_height) - 1.0
@@ -372,12 +291,12 @@ class EquirectangularNode(Node):
                     back_map_y_norm = 2.0 * (self.back_map_y / self.img_height) - 1.0
                     self.back_grid = torch.stack([back_map_x_norm, back_map_y_norm], dim=-1).unsqueeze(0)
                     
-                    if self.front_mask is not None: # Check front_mask before use
+                    if self.front_mask is not None:
                         self.front_mask_gpu = self.front_mask.float().unsqueeze(0).unsqueeze(0)
-                    if self.back_mask is not None: # Check back_mask before use
+                    if self.back_mask is not None:
                         self.back_mask_gpu = self.back_mask.float().unsqueeze(0).unsqueeze(0)
                     
-                    # GPU edge and blend masks (if needed for GPU blending later)
+                    # GPU edge and blend masks
                     if self.front_edge is not None:
                         self.edge_mask_gpu = torch.from_numpy(self.front_edge.astype(np.float32)).to(self.device, non_blocking=True).unsqueeze(0).unsqueeze(0)
                     if self.front_distance is not None:
@@ -386,7 +305,7 @@ class EquirectangularNode(Node):
                     self.get_logger().info("GPU acceleration resources initialized successfully")
 
             except Exception as e:
-                self.use_cuda = False # Fallback if GPU init fails
+                self.use_cuda = False
                 self.get_logger().error(f"Error initializing GPU acceleration resources, falling back to CPU: {e}")
         
         self.get_logger().info(f"Mapping matrices initialization complete (GPU: {self.use_cuda})")
@@ -404,15 +323,13 @@ class EquirectangularNode(Node):
             front_img_full = cv2.rotate(front_img_full, cv2.ROTATE_90_COUNTERCLOCKWISE)
             back_img_full = cv2.rotate(back_img_full, cv2.ROTATE_90_CLOCKWISE)
             
-            # Store original uncropped images if not already stored or if they change
-            # This is useful if crop_size can change dynamically via parameters after startup
+            # Store original uncropped images
             if self.original_front_img is None or self.original_front_img.shape != front_img_full.shape:
                 self.original_front_img = front_img_full.copy()
             if self.original_back_img is None or self.original_back_img.shape != back_img_full.shape:
                 self.original_back_img = back_img_full.copy()
 
-            # Determine current front_img and back_img based on crop_size
-            # This logic assumes self.crop_size is an int and has been validated
+            # Crop images based on crop_size parameter
             current_crop_size = self.crop_size
             orig_h, orig_w = front_img_full.shape[:2]
 
@@ -432,24 +349,23 @@ class EquirectangularNode(Node):
                 front_img = front_img_full
                 back_img = back_img_full
             
-            self.last_front_img = front_img.copy() # For calibration view
-            self.last_back_img = back_img.copy()   # For calibration view
+            self.last_front_img = front_img.copy()
+            self.last_back_img = back_img.copy()
             
-            # Initialize mapping if needed or if input image dimensions/params changed
-            # Check self.img_height and self.img_width against current front_img dimensions
+            # Initialize mapping if needed
             if not self.maps_initialized or self.params_changed or \
                (self.img_height is not None and front_img.shape[0] != self.img_height) or \
                (self.img_width is not None and front_img.shape[1] != self.img_width):
                 self.init_mapping(front_img.shape[0], front_img.shape[1])
-                self.params_changed = False # Reset flag after re-initialization
+                self.params_changed = False
             
             start_time = self.get_clock().now()
-            if self.use_cuda and self.maps_initialized: # Ensure maps are ready for GPU
+            if self.use_cuda and self.maps_initialized:
                 try:
                     equirect_img = self.create_equirectangular_gpu(front_img, back_img)
                 except Exception as e:
                     self.get_logger().warn(f"GPU processing error: {e}, falling back to CPU")
-                    self.use_cuda = False # Disable GPU for subsequent frames if it errors
+                    self.use_cuda = False
                     equirect_img = self.create_equirectangular(front_img, back_img)
             else:
                 if not self.maps_initialized:
@@ -473,20 +389,17 @@ class EquirectangularNode(Node):
 
     def create_equirectangular(self, front_img: np.ndarray, back_img: np.ndarray) -> np.ndarray:
         """Create equirectangular image from front and back fisheye images using CPU."""
-        # Ensure maps are initialized, re-initialize if necessary
         if not self.maps_initialized or self.params_changed or \
            (self.img_height is not None and front_img.shape[0] != self.img_height) or \
            (self.img_width is not None and front_img.shape[1] != self.img_width):
             self.init_mapping(front_img.shape[0], front_img.shape[1])
             self.params_changed = False
         
-        # Fallback if maps are still not ready (e.g., output dimensions were None)
         if not self.maps_initialized or self.front_map_x_np is None or self.front_map_y_np is None or \
            self.back_map_x_np is None or self.back_map_y_np is None or \
            self.front_mask_np is None or self.front_edge is None or \
-           self.out_height is None or self.out_width is None: # out_height/width check
+           self.out_height is None or self.out_width is None:
             self.get_logger().error("CPU Mapping arrays or output dimensions not properly initialized. Returning black image.")
-            # Attempt to use declared defaults if instance attributes are None
             h = self.out_height if self.out_height is not None else 1920
             w = self.out_width if self.out_width is not None else 3840
             return np.zeros((h, w, 3), dtype=np.uint8)
@@ -507,7 +420,6 @@ class EquirectangularNode(Node):
         if self.front_distance is not None:
             blend_region = (self.front_edge == 1)
             if np.any(blend_region):
-                # Ensure alpha is correctly shaped for broadcasting
                 alpha = self.front_distance[blend_region][..., np.newaxis] 
                 equirect[blend_region] = (alpha * front_result[blend_region].astype(np.float32) + 
                                         (1 - alpha) * back_result[blend_region].astype(np.float32)).astype(np.uint8)
@@ -516,21 +428,19 @@ class EquirectangularNode(Node):
     
     def create_equirectangular_gpu(self, front_img: np.ndarray, back_img: np.ndarray) -> np.ndarray:
         """Create equirectangular image using GPU acceleration."""
-        if not self.use_cuda: # Safeguard
+        if not self.use_cuda:
             self.get_logger().warn("GPU processing called but not enabled/initialized. Falling back to CPU.")
             return self.create_equirectangular(front_img, back_img)
 
-        # Ensure maps are initialized, re-initialize if necessary
         if not self.maps_initialized or self.params_changed or \
            (self.img_height is not None and front_img.shape[0] != self.img_height) or \
            (self.img_width is not None and front_img.shape[1] != self.img_width):
             self.init_mapping(front_img.shape[0], front_img.shape[1])
             self.params_changed = False
         
-        # Fallback if maps or GPU resources are still not ready
         if not self.maps_initialized or self.front_grid is None or self.back_grid is None or \
            self.front_mask_gpu is None or self.back_mask_gpu is None or \
-           self.out_height is None or self.out_width is None: # out_height/width check
+           self.out_height is None or self.out_width is None:
             self.get_logger().error("GPU grids or masks not initialized. Falling back to CPU processing.")
             self.use_cuda = False 
             return self.create_equirectangular(front_img, back_img)
@@ -541,14 +451,11 @@ class EquirectangularNode(Node):
         front_remapped = F.grid_sample(front_tensor, self.front_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
         back_remapped = F.grid_sample(back_tensor, self.back_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
         
-        # Interpolation might be needed if grid_sample output size doesn't match out_height/out_width
-        # This depends on how front_grid and back_grid are constructed relative to out_height/out_width
         if front_remapped.shape[2:] != (self.out_height, self.out_width):
             front_remapped = F.interpolate(front_remapped, size=(self.out_height, self.out_width), mode='bilinear', align_corners=True)
         if back_remapped.shape[2:] != (self.out_height, self.out_width):
             back_remapped = F.interpolate(back_remapped, size=(self.out_height, self.out_width), mode='bilinear', align_corners=True)
         
-        # Combine using masks
         output = front_remapped * self.front_mask_gpu + back_remapped * self.back_mask_gpu
         
         output_np = output.squeeze(0).permute(1, 2, 0).cpu().numpy()
@@ -566,18 +473,15 @@ class EquirectangularNode(Node):
         cv2.namedWindow(self.control_window, cv2.WINDOW_NORMAL)
         
         # Create trackbars with more intuitive ranges
-        # Camera center offsets: range -100 to +100
         cv2.createTrackbar("CX Offset [-100,100]", self.control_window, 100, 200, self.update_cx)
         cv2.setTrackbarPos("CX Offset [-100,100]", self.control_window, int(self.cx_offset) + 100)
         
         cv2.createTrackbar("CY Offset [-100,100]", self.control_window, 100, 200, self.update_cy)
         cv2.setTrackbarPos("CY Offset [-100,100]", self.control_window, int(self.cy_offset) + 100)
         
-        # Crop size (not centered around zero)
         cv2.createTrackbar("Crop Size", self.control_window, 1920, 3840, self.update_crop)
         cv2.setTrackbarPos("Crop Size", self.control_window, self.crop_size)
         
-        # Translation parameters: range -0.5 to +0.5
         cv2.createTrackbar("TX [-0.5,0.5]", self.control_window, 500, 1000, self.update_tx)
         cv2.setTrackbarPos("TX [-0.5,0.5]", self.control_window, int(self.tx * 1000) + 500)
         
@@ -587,7 +491,6 @@ class EquirectangularNode(Node):
         cv2.createTrackbar("TZ [-0.5,0.5]", self.control_window, 500, 1000, self.update_tz)
         cv2.setTrackbarPos("TZ [-0.5,0.5]", self.control_window, int(self.tz * 1000) + 500)
         
-        # Rotation parameters: range -180 to +180 degrees
         cv2.createTrackbar("Roll [-180°,180°]", self.control_window, 1800, 3600, self.update_roll)
         cv2.setTrackbarPos("Roll [-180°,180°]", self.control_window, int(math.degrees(self.roll) * 10) + 1800)
         
@@ -597,14 +500,14 @@ class EquirectangularNode(Node):
         cv2.createTrackbar("Yaw [-180°,180°]", self.control_window, 1800, 3600, self.update_yaw)
         cv2.setTrackbarPos("Yaw [-180°,180°]", self.control_window, int(math.degrees(self.yaw) * 10) + 1800)
 
-   # Trackbar update callbacks for calibration
+    # Trackbar update callbacks for calibration
     def update_cx(self, value):
-        self.cx_offset = float(value - 100)  # -100 to +100 range
+        self.cx_offset = float(value - 100)
         self.set_parameters([Parameter('cx_offset', Parameter.Type.DOUBLE, self.cx_offset)])
         self.params_changed = True
 
     def update_cy(self, value):
-        self.cy_offset = float(value - 100)  # -100 to +100 range
+        self.cy_offset = float(value - 100)
         self.set_parameters([Parameter('cy_offset', Parameter.Type.DOUBLE, self.cy_offset)])
         self.params_changed = True
         
@@ -612,7 +515,6 @@ class EquirectangularNode(Node):
         self.crop_size = value
         self.set_parameters([Parameter('crop_size', Parameter.Type.INTEGER, self.crop_size)])
         
-        # Re-crop original images with new crop size
         if self.original_front_img is not None and self.original_back_img is not None:
             orig_height, orig_width = self.original_front_img.shape[:2]
             y_start = (orig_height - self.crop_size) // 2
@@ -628,36 +530,35 @@ class EquirectangularNode(Node):
         else:
             self.get_logger().warn("Original images not available for re-cropping in update_crop.")
         
-        self.params_changed = True # Signal that mapping might need update
-        # No direct call to init_mapping here; let image_callback handle it if dimensions change
+        self.params_changed = True
 
     def update_tx(self, value):
-        self.tx = float((value - 500) / 1000.0)  # -0.5 to +0.5 range
+        self.tx = float((value - 500) / 1000.0)
         self.set_parameters([Parameter('tx', Parameter.Type.DOUBLE, self.tx)])
         self.params_changed = True
 
     def update_ty(self, value):
-        self.ty = float((value - 500) / 1000.0)  # -0.5 to +0.5 range
+        self.ty = float((value - 500) / 1000.0)
         self.set_parameters([Parameter('ty', Parameter.Type.DOUBLE, self.ty)])
         self.params_changed = True
 
     def update_tz(self, value):
-        self.tz = float((value - 500) / 1000.0)  # -0.5 to +0.5 range
+        self.tz = float((value - 500) / 1000.0)
         self.set_parameters([Parameter('tz', Parameter.Type.DOUBLE, self.tz)])
         self.params_changed = True
 
     def update_roll(self, value):
-        self.roll = float(math.radians((value - 1800) / 10.0))  # -180 to +180 degrees
+        self.roll = float(math.radians((value - 1800) / 10.0))
         self.set_parameters([Parameter('roll', Parameter.Type.DOUBLE, self.roll)])
         self.params_changed = True
 
     def update_pitch(self, value):
-        self.pitch = float(math.radians((value - 1800) / 10.0))  # -180 to +180 degrees
+        self.pitch = float(math.radians((value - 1800) / 10.0))
         self.set_parameters([Parameter('pitch', Parameter.Type.DOUBLE, self.pitch)])
         self.params_changed = True
 
     def update_yaw(self, value):
-        self.yaw = float(math.radians((value - 1800) / 10.0))  # -180 to +180 degrees
+        self.yaw = float(math.radians((value - 1800) / 10.0))
         self.set_parameters([Parameter('yaw', Parameter.Type.DOUBLE, self.yaw)])
         self.params_changed = True
     
@@ -667,22 +568,16 @@ class EquirectangularNode(Node):
             return
         
         if self.params_changed:
-            # Call update_camera_parameters to sync with ROS parameters
             self.update_camera_parameters()
             self.maps_initialized = False
-            # Don't reset params_changed here - let create_equirectangular handle it
             
-        # Force remapping for calibration view
         if self.maps_initialized:
             self.maps_initialized = False
         
-        # Create a copy of equirectangular image to add text
         equirect_bgr = cv2.cvtColor(self.create_equirectangular(self.last_front_img, self.last_back_img), cv2.COLOR_RGB2BGR)
         
-        # Now that create_equirectangular has run, we can reset params_changed
         self.params_changed = False
         
-        # Display current parameters
         info_text = (
             f"cx: {self.crop_size/2 + self.cx_offset:.1f}, cy: {self.crop_size/2 + self.cy_offset:.1f} | "
             f"crop: {self.crop_size} | "
@@ -690,7 +585,6 @@ class EquirectangularNode(Node):
             f"r: [{math.degrees(self.roll):.1f}, {math.degrees(self.pitch):.1f}, {math.degrees(self.yaw):.1f}]"
         )
         
-        # Add info text to frame
         cv2.putText(
             equirect_bgr, 
             info_text,
@@ -703,35 +597,22 @@ class EquirectangularNode(Node):
         
         cv2.imshow(self.window_name, equirect_bgr)
         
-        # Process key presses immediately
         key = cv2.waitKey(1)
-        if key == ord('s'):  # Save parameters
+        if key == ord('s'):
             self.save_calibration()
-        elif key == ord('q'):  # Quit calibration mode
+        elif key == ord('q'):
             self.get_logger().info("Exiting calibration mode")
             cv2.destroyAllWindows()
             self.calibration_mode = False
 
 
 def main(args=None):
-    # Initialize ROS first with all its args
     rclpy.init(args=args)
     
-    # Process arguments regardless of launch method
+    # Check for calibration mode
     enable_calibration = '--calibrate' in sys.argv
-    use_gpu = '--gpu' in sys.argv
-    calibration_file = '/home/triton/ros2_ws/src/Triton/dependencies/insta360_ros_driver/config/extrinsics_x2.json'
     
-    # Check for custom calibration file
-    for i, arg in enumerate(sys.argv[1:-1], 1):
-        if arg == '--calibration_file' and i < len(sys.argv)-1:
-            calibration_file = sys.argv[i+1]
-    
-    node = EquirectangularNode(
-        enable_calibration=enable_calibration,
-        calibration_file=calibration_file,
-        use_gpu=use_gpu
-    )
+    node = EquirectangularNode(enable_calibration=enable_calibration)
     
     try:
         rclpy.spin(node)

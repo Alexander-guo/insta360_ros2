@@ -123,7 +123,7 @@ public:
         auto start = time(NULL);
         cam->SyncLocalTimeToCamera(start);        
         ins_camera::LiveStreamParam param;
-        param.video_resolution = ins_camera::VideoResolution::RES_3840_1920P30;
+        param.video_resolution = ins_camera::VideoResolution::RES_1920_960P30;
         param.lrv_video_resulution = ins_camera::VideoResolution::RES_1440_720P30;
         param.video_bitrate = 1024 * 1024 / 2;
         param.enable_audio = false;
