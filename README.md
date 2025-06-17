@@ -36,19 +36,18 @@ This creates a symlink  based on the vendor ID of Insta360 cameras. The symlink,
 
 **Sometimes, this does not work (e.g. you see "device /dev/insta not found" or something similar). You can try entering the commands manually, since that sometimes sees success, especially for the first time.**
 ```
-echo SUBSYSTEM=='"usb"', ATTR{idVendor}=='"2e1a"', SYMLINK+='"insta"' | sudo tee /etc/udev/rules.d/99-insta.rules
+echo SUBSYSTEM=='"usb"', ATTR{manufacturer}=='"Arashi Vision"', SYMLINK+='"insta"', MODE='"0777"' | sudo tee /etc/udev/rules.d/99-insta.rules
 sudo udevadm trigger
 sudo chmod 777 /dev/insta
 ```
-**Note that you need to setup permissions every time the camera is turned off or disconnected.**
 
 ## Usage
-This driver directly publishes the video feed in YUV format, since that is the camera's native setting. Alongside this, the driver also publishes the camera feed as standard BGR images to the <code>/front_camera_image/compressed</code> and <code>/back_camera_image/compressed</code> topics. Note that the compressed images have some amount of latency (~50 ms) compared to the raw output. 
+The camera provides images natively in H264 compressed image format. We have a decoder node that 
 
 ### Camera Bringup
 The camera can be brought up with the following launch file
 ```
-ros2 launch insta360_ros_driver bringup.launch
+ros2 launch insta360_ros_driver bringup.launch.xml
 ```
 ![bringup](docs/bringup_rqt.png)
 
@@ -58,6 +57,7 @@ A dual fisheye image will be published.
 
 #### Published Topics
 - /dual_fisheye/image
+- /dual_fisheye/image/compressed
 - /equirectangular/image
 - /imu/data
 - /imu/data_raw
@@ -65,19 +65,23 @@ A dual fisheye image will be published.
 The launch file has the following optional arguments:
 - equirectangular (default="true")
 
+This publishes equirectangular images.
 ![equirectangular](docs/equirectangular.png)
 
-Whether to enable equirectangular image projection
+- imu_filter (default="true")
 
-- undistort (default="false")
-
-Whether to publish front and back rectilinear images
-
-![rectilinear](docs/rectilinear.png)
-
-The IMU allows for frame stabilization. For instance, you are able to visualize the orientation of the camera.
+This uses the [imu_filter_madgwick](https://wiki.ros.org/imu_filter_madgwick) package to approximate orientation from the IMU.
 
 ![IMU](https://github.com/user-attachments/assets/02b50cad-8415-4dde-9014-9ab3a4d415b9)
+
+## Equirectangular Calibration
+You can adjust the extrinsic parameters used to improve the equirectangular image. 
+```
+# Run the camera driver
+ros2 run insta360_ros_driver insta360_ros_driver
+# Run the equirectangular node in calibration mode
+ros2 run insta360_ros_driver equirectangular.py --calibrate
+```
 
 ## Star History
 
