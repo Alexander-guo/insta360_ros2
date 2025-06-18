@@ -1,7 +1,8 @@
 bag/*
 image_capture/*
 lib/*
-include/*
+include/camera/*
+include/stream/*
 .vscode
 *.pyc
 
