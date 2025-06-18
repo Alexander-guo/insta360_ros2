@@ -72,6 +72,19 @@ install(TARGETS decoder
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# Add C++ equirectangular node
+add_executable(equirectangular_cpp src/equirectangular.cpp)
+ament_target_dependencies(equirectangular_cpp
+  rclcpp
+  cv_bridge
+  OpenCV
+)
+target_link_libraries(equirectangular_cpp ${OpenCV_LIBRARIES})
+
+install(TARGETS equirectangular_cpp
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS
   scripts/equirectangular.py

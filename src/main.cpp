@@ -127,8 +127,8 @@ public:
         //Possible resolutions (results may vary per model) are:
         //RES_3840_1920P30
         //RES_2560_1280P30
-        //RES_1920_960P30  
         //RES_1152_1152P30 (this will give 2304 x 1152 at 30 FPS)
+        //RES_1920_960P30  
         param.lrv_video_resulution = ins_camera::VideoResolution::RES_1440_720P30;
         param.video_bitrate = 1024 * 1024 / 2;
         param.enable_audio = false;

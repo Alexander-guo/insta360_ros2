@@ -1,6 +1,10 @@
 # insta360_ros_driver
 
-A ROS driver for the Insta360 cameras. This driver is tested on Ubuntu 22.04 with ROS2 Humble. The driver has also been verified on the Insta360 X2 and X3 cameras. By default, we are able to stream 1920 x 960 images.
+A ROS driver for the Insta360 cameras. This driver is tested on Ubuntu 22.04 with ROS2 Humble. The driver has also been verified on the Insta360 X2 and X3 cameras. The following resolutions are available, all at 30 FPS.
+- 3840 x 1920
+- 2560 x 1280
+- 2304 x 1152
+- 1920 x 960
 
 ## Installation
 To use this driver, you need to first have Insta360 SDK. Please apply for the SDK from the [Insta360 website](https://www.insta360.com/sdk/home). 
@@ -80,7 +84,7 @@ You can adjust the extrinsic parameters used to improve the equirectangular imag
 # Run the camera driver
 ros2 run insta360_ros_driver insta360_ros_driver
 # Activate image decoding
-ros2 run insta360_ros_driver decode.py
+ros2 run insta360_ros_driver decoder
 # Run the equirectangular node in calibration mode
 ros2 run insta360_ros_driver equirectangular.py --calibrate
 ```
