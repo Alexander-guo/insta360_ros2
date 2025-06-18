@@ -4,9 +4,8 @@
 #include <thread>
 #include <chrono>
 
-EquirectangularNode::EquirectangularNode(bool enable_calibration)
+EquirectangularNode::EquirectangularNode()
     : Node("equirectangular_node"),
-      calibration_mode_(enable_calibration),
       maps_initialized_(false),
       params_changed_(true),
       img_height_(0),
@@ -28,10 +27,6 @@ EquirectangularNode::EquirectangularNode(bool enable_calibration)
     // Log GPU settings (note: C++ version currently only supports CPU)
     RCLCPP_INFO(get_logger(), "C++ equirectangular node - CPU processing only (GPU via Python node)");
     
-    // Force initial update in calibration mode
-    if (calibration_mode_) {
-        params_changed_ = true;
-    }
     
     // Add parameter callback
     auto params_callback_handle = add_on_set_parameters_callback(
@@ -49,18 +44,10 @@ EquirectangularNode::EquirectangularNode(bool enable_calibration)
     
     equirect_pub_ = create_publisher<sensor_msgs::msg::Image>(
         "/equirectangular/image", qos);
-    
-    if (calibration_mode_) {
-        RCLCPP_INFO(get_logger(), "Calibration mode enabled");
-        setupCalibrationUI();
-    }
 }
 
 EquirectangularNode::~EquirectangularNode()
 {
-    if (calibration_mode_) {
-        cv::destroyAllWindows();
-    }
 }
 
 void EquirectangularNode::loadParameters()
@@ -119,7 +106,7 @@ void EquirectangularNode::updateCameraParameters()
     back_to_front_rotation_ = Rz * Ry * Rx;
     back_to_front_translation_ = cv::Vec3d(tx_, ty_, tz_);
     
-    if (maps_initialized_ && !calibration_mode_) {
+    if (maps_initialized_) {
         maps_initialized_ = false;
         RCLCPP_INFO(get_logger(), "Parameters updated, remapping will occur on next image");
     }
@@ -277,6 +264,7 @@ cv::Mat EquirectangularNode::createEquirectangular(const cv::Mat& front_img, con
 
 void EquirectangularNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr dual_fisheye_msg)
 {
+    
     try {
         cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(dual_fisheye_msg, "rgb8");
         cv::Mat dual_fisheye_img = cv_ptr->image;
@@ -291,15 +279,6 @@ void EquirectangularNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr
         cv::rotate(front_img_full, front_img_full, cv::ROTATE_90_COUNTERCLOCKWISE);
         cv::rotate(back_img_full, back_img_full, cv::ROTATE_90_CLOCKWISE);
         
-        // Store original uncropped images
-        if (calibration_mode_ || original_front_img_.empty() ||
-            original_front_img_.size() != front_img_full.size()) {
-            original_front_img_ = front_img_full.clone();
-        }
-        if (calibration_mode_ || original_back_img_.empty() ||
-            original_back_img_.size() != back_img_full.size()) {
-            original_back_img_ = back_img_full.clone();
-        }
         
         // Crop images based on crop_size parameter
         cv::Mat front_img, back_img;
@@ -325,21 +304,12 @@ void EquirectangularNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr
             back_img = back_img_full;
         }
         
-        last_front_img_ = front_img.clone();
-        last_back_img_ = back_img.clone();
         
         // Initialize mapping if needed
-        if (calibration_mode_) {
-            if (!maps_initialized_ || params_changed_) {
-                initMapping(front_img.rows, front_img.cols);
-                params_changed_ = false;
-            }
-        } else {
-            if (!maps_initialized_ || params_changed_ ||
-                front_img.rows != img_height_ || front_img.cols != img_width_) {
-                initMapping(front_img.rows, front_img.cols);
-                params_changed_ = false;
-            }
+        if (!maps_initialized_ || params_changed_ ||
+            front_img.rows != img_height_ || front_img.cols != img_width_) {
+            initMapping(front_img.rows, front_img.cols);
+            params_changed_ = false;
         }
         
         auto start_time = now();
@@ -354,10 +324,6 @@ void EquirectangularNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr
         
         auto process_time = (now() - start_time).seconds();
         RCLCPP_DEBUG(get_logger(), "Processing time: %.3f seconds", process_time);
-        
-        if (calibration_mode_) {
-            updateCalibrationView();
-        }
         
     } catch (const cv_bridge::Exception& e) {
         RCLCPP_ERROR(get_logger(), "cv_bridge exception: %s", e.what());
@@ -394,262 +360,12 @@ rcl_interfaces::msg::SetParametersResult EquirectangularNode::parametersCallback
     return result;
 }
 
-void EquirectangularNode::setupCalibrationUI()
-{
-    window_name_ = "Equirectangular Calibration";
-    control_window_ = "Calibration Controls";
-    
-    cv::namedWindow(window_name_, cv::WINDOW_NORMAL);
-    cv::resizeWindow(window_name_, out_width_ / 2, out_height_ / 2);
-    cv::namedWindow(control_window_, cv::WINDOW_NORMAL);
-    
-    // Create trackbars
-    cv::createTrackbar("CX Offset [-100,100]", control_window_,
-                       nullptr, 200, &EquirectangularNode::onCxOffsetChange, this);
-    cv::setTrackbarPos("CX Offset [-100,100]", control_window_, static_cast<int>(cx_offset_) + 100);
-    
-    cv::createTrackbar("CY Offset [-100,100]", control_window_,
-                       nullptr, 200, &EquirectangularNode::onCyOffsetChange, this);
-    cv::setTrackbarPos("CY Offset [-100,100]", control_window_, static_cast<int>(cy_offset_) + 100);
-    
-    cv::createTrackbar("Crop Size", control_window_,
-                       nullptr, 1920, &EquirectangularNode::onCropSizeChange, this);
-    cv::setTrackbarPos("Crop Size", control_window_, crop_size_);
-    
-    cv::createTrackbar("TX [-0.5,0.5]", control_window_,
-                       nullptr, 1000, &EquirectangularNode::onTxChange, this);
-    cv::setTrackbarPos("TX [-0.5,0.5]", control_window_, static_cast<int>(tx_ * 1000) + 500);
-    
-    cv::createTrackbar("TY [-0.5,0.5]", control_window_,
-                       nullptr, 1000, &EquirectangularNode::onTyChange, this);
-    cv::setTrackbarPos("TY [-0.5,0.5]", control_window_, static_cast<int>(ty_ * 1000) + 500);
-    
-    cv::createTrackbar("TZ [-0.5,0.5]", control_window_,
-                       nullptr, 1000, &EquirectangularNode::onTzChange, this);
-    cv::setTrackbarPos("TZ [-0.5,0.5]", control_window_, static_cast<int>(tz_ * 1000) + 500);
-    
-    cv::createTrackbar("Roll [-180°,180°]", control_window_,
-                       nullptr, 3600, &EquirectangularNode::onRollChange, this);
-    cv::setTrackbarPos("Roll [-180°,180°]", control_window_,
-                       static_cast<int>(roll_ * 180.0 / M_PI * 10) + 1800);
-    
-    cv::createTrackbar("Pitch [-180°,180°]", control_window_,
-                       nullptr, 3600, &EquirectangularNode::onPitchChange, this);
-    cv::setTrackbarPos("Pitch [-180°,180°]", control_window_,
-                       static_cast<int>(pitch_ * 180.0 / M_PI * 10) + 1800);
-    
-    cv::createTrackbar("Yaw [-180°,180°]", control_window_,
-                       nullptr, 3600, &EquirectangularNode::onYawChange, this);
-    cv::setTrackbarPos("Yaw [-180°,180°]", control_window_,
-                       static_cast<int>(yaw_ * 180.0 / M_PI * 10) + 1800);
-}
-
-void EquirectangularNode::updateCalibrationView()
-{
-    if (window_name_.empty() || last_front_img_.empty() || last_back_img_.empty()) {
-        return;
-    }
-    
-    cv::Mat equirect_rgb;
-    if (params_changed_) {
-        equirect_rgb = createEquirectangular(last_front_img_, last_back_img_);
-        if (!equirect_rgb.empty()) {
-            cv::cvtColor(equirect_rgb, cached_equirect_, cv::COLOR_RGB2BGR);
-        }
-        params_changed_ = false;
-    } else {
-        if (cached_equirect_.empty()) {
-            equirect_rgb = createEquirectangular(last_front_img_, last_back_img_);
-            if (!equirect_rgb.empty()) {
-                cv::cvtColor(equirect_rgb, cached_equirect_, cv::COLOR_RGB2BGR);
-            }
-        }
-    }
-    
-    if (cached_equirect_.empty()) {
-        return;
-    }
-    
-    cv::Mat display = cached_equirect_.clone();
-    
-    // Add text info
-    std::stringstream info;
-    info << "cx: " << std::fixed << std::setprecision(1) << (crop_size_/2.0 + cx_offset_)
-         << ", cy: " << (crop_size_/2.0 + cy_offset_)
-         << " | crop: " << crop_size_
-         << " | t: [" << std::setprecision(3) << tx_ << ", " << ty_ << ", " << tz_ << "]"
-         << " | r: [" << std::setprecision(1) << (roll_ * 180.0 / M_PI)
-         << ", " << (pitch_ * 180.0 / M_PI)
-         << ", " << (yaw_ * 180.0 / M_PI) << "]";
-    
-    cv::putText(display, info.str(), cv::Point(10, 30),
-                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
-    
-    cv::putText(display, "Press 'a' to Apply | 's' to Save | 'q' to Quit",
-                cv::Point(10, display.rows - 20),
-                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
-    
-    cv::imshow(window_name_, display);
-    
-    char key = cv::waitKey(1);
-    if (key == 'a') {
-        applyParameters();
-        cached_equirect_ = cv::Mat();
-    } else if (key == 's') {
-        saveCalibration();
-    } else if (key == 'q') {
-        RCLCPP_INFO(get_logger(), "Exiting calibration mode");
-        cv::destroyAllWindows();
-        calibration_mode_ = false;
-    }
-}
-
-void EquirectangularNode::applyParameters()
-{
-    // Re-crop images if crop size changed
-    if (!original_front_img_.empty() && !original_back_img_.empty()) {
-        int orig_height = original_front_img_.rows;
-        int orig_width = original_front_img_.cols;
-        int y_start = (orig_height - crop_size_) / 2;
-        int x_start = (orig_width - crop_size_) / 2;
-        
-        if (y_start >= 0 && x_start >= 0 &&
-            y_start + crop_size_ <= orig_height &&
-            x_start + crop_size_ <= orig_width) {
-            last_front_img_ = original_front_img_(cv::Rect(x_start, y_start, crop_size_, crop_size_)).clone();
-            last_back_img_ = original_back_img_(cv::Rect(x_start, y_start, crop_size_, crop_size_)).clone();
-            RCLCPP_INFO(get_logger(), "Re-cropped images to %dx%d", crop_size_, crop_size_);
-        } else {
-            RCLCPP_WARN(get_logger(), "Cannot re-crop to %d. Using current images.", crop_size_);
-        }
-    }
-    
-    // Update all parameters in ROS
-    set_parameter(rclcpp::Parameter("cx_offset", cx_offset_));
-    set_parameter(rclcpp::Parameter("cy_offset", cy_offset_));
-    set_parameter(rclcpp::Parameter("crop_size", crop_size_));
-    set_parameter(rclcpp::Parameter("translation", std::vector<double>{tx_, ty_, tz_}));
-    set_parameter(rclcpp::Parameter("rotation_deg", std::vector<double>{
-        roll_ * 180.0 / M_PI,
-        pitch_ * 180.0 / M_PI,
-        yaw_ * 180.0 / M_PI
-    }));
-    
-    // Force remapping
-    updateCameraParameters();
-    maps_initialized_ = false;
-    params_changed_ = true;
-    
-    RCLCPP_INFO(get_logger(), "Parameters applied successfully");
-}
-
-bool EquirectangularNode::saveCalibration()
-{
-    try {
-        set_parameter(rclcpp::Parameter("cx_offset", cx_offset_));
-        set_parameter(rclcpp::Parameter("cy_offset", cy_offset_));
-        set_parameter(rclcpp::Parameter("crop_size", crop_size_));
-        set_parameter(rclcpp::Parameter("translation", std::vector<double>{tx_, ty_, tz_}));
-        set_parameter(rclcpp::Parameter("rotation_deg", std::vector<double>{
-            roll_ * 180.0 / M_PI,
-            pitch_ * 180.0 / M_PI,
-            yaw_ * 180.0 / M_PI
-        }));
-        
-        // Print parameters in YAML format
-        std::cout << "\n" << std::string(50, '=') << std::endl;
-        std::cout << "CALIBRATION PARAMETERS (YAML FORMAT)" << std::endl;
-        std::cout << std::string(50, '=') << std::endl;
-        std::cout << "equirectangular_node:" << std::endl;
-        std::cout << "  ros__parameters:" << std::endl;
-        std::cout << "    cx_offset: " << cx_offset_ << std::endl;
-        std::cout << "    cy_offset: " << cy_offset_ << std::endl;
-        std::cout << "    crop_size: " << crop_size_ << std::endl;
-        std::cout << "    translation: [" << tx_ << ", " << ty_ << ", " << tz_ << "]" << std::endl;
-        std::cout << "    rotation_deg: [" << (roll_ * 180.0 / M_PI) << ", "
-                  << (pitch_ * 180.0 / M_PI) << ", " << (yaw_ * 180.0 / M_PI) << "]" << std::endl;
-        std::cout << "    gpu: " << (gpu_enabled_ ? "true" : "false") << std::endl;
-        std::cout << "    out_width: " << out_width_ << std::endl;
-        std::cout << "    out_height: " << out_height_ << std::endl;
-        std::cout << std::string(50, '=') << "\n" << std::endl;
-        
-        RCLCPP_INFO(get_logger(), "Parameters saved to ROS parameter server and printed above");
-        return true;
-    } catch (const std::exception& e) {
-        RCLCPP_ERROR(get_logger(), "Error saving parameters: %s", e.what());
-        return false;
-    }
-}
-
-// Static trackbar callbacks
-void EquirectangularNode::onCxOffsetChange(int value, void* userdata)
-{
-    auto* node = static_cast<EquirectangularNode*>(userdata);
-    node->cx_offset_ = static_cast<double>(value - 100);
-}
-
-void EquirectangularNode::onCyOffsetChange(int value, void* userdata)
-{
-    auto* node = static_cast<EquirectangularNode*>(userdata);
-    node->cy_offset_ = static_cast<double>(value - 100);
-}
-
-void EquirectangularNode::onCropSizeChange(int value, void* userdata)
-{
-    auto* node = static_cast<EquirectangularNode*>(userdata);
-    node->crop_size_ = value;
-}
-
-void EquirectangularNode::onTxChange(int value, void* userdata)
-{
-    auto* node = static_cast<EquirectangularNode*>(userdata);
-    node->tx_ = static_cast<double>(value - 500) / 1000.0;
-}
-
-void EquirectangularNode::onTyChange(int value, void* userdata)
-{
-    auto* node = static_cast<EquirectangularNode*>(userdata);
-    node->ty_ = static_cast<double>(value - 500) / 1000.0;
-}
-
-void EquirectangularNode::onTzChange(int value, void* userdata)
-{
-    auto* node = static_cast<EquirectangularNode*>(userdata);
-    node->tz_ = static_cast<double>(value - 500) / 1000.0;
-}
-
-void EquirectangularNode::onRollChange(int value, void* userdata)
-{
-    auto* node = static_cast<EquirectangularNode*>(userdata);
-    node->roll_ = static_cast<double>(value - 1800) / 10.0 * M_PI / 180.0;
-}
-
-void EquirectangularNode::onPitchChange(int value, void* userdata)
-{
-    auto* node = static_cast<EquirectangularNode*>(userdata);
-    node->pitch_ = static_cast<double>(value - 1800) / 10.0 * M_PI / 180.0;
-}
-
-void EquirectangularNode::onYawChange(int value, void* userdata)
-{
-    auto* node = static_cast<EquirectangularNode*>(userdata);
-    node->yaw_ = static_cast<double>(value - 1800) / 10.0 * M_PI / 180.0;
-}
 
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
     
-    // Check for calibration mode
-    bool enable_calibration = false;
-    for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--calibrate") {
-            enable_calibration = true;
-            break;
-        }
-    }
-    
-    auto node = std::make_shared<EquirectangularNode>(enable_calibration);
+    auto node = std::make_shared<EquirectangularNode>();
     
     try {
         rclcpp::spin(node);

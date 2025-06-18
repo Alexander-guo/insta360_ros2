@@ -88,7 +88,7 @@ ros2 run insta360_ros_driver decoder
 # Run the equirectangular node in calibration mode
 ros2 run insta360_ros_driver equirectangular.py --calibrate
 ```
-This will open an app to adjust the extrinsics. You need to press 'a' to update the parameters and you can press 's' to get the parameters in YAML format.
+This will open an app to adjust the extrinsics. You can press 's' to get the parameters in YAML format.
 ![Equirectangular Calibration](docs/calibration.png)
 
 Pressing 's' will return the parameters via the terminal. You can copy paste this onto the configuration file as needed. By default, the launch file reads this from `config/equirectangular.yaml`

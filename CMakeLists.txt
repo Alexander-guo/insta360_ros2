@@ -88,6 +88,7 @@ install(TARGETS equirectangular_cpp
 ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS
   scripts/equirectangular.py
+  scripts/calibrate.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
