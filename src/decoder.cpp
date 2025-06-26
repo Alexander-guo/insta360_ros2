@@ -54,6 +54,10 @@ private:
     std::condition_variable queue_cv_;
     std::atomic<bool> stop_publisher_thread_{false};
     size_t max_queue_size_ = 10;
+    
+    int skip_frame_ = 0;
+    int frame_counter_ = 0;
+    bool i_frame_only_ = false;
 
     void InitFFmpegDecoder() {
         hw_type_ = AV_HWDEVICE_TYPE_CUDA;
@@ -207,14 +211,24 @@ private:
                             0, frame_to_display->height,
                             dst_data, dst_linesize);
 
-                cv::Mat frame_copy = bgr_frame_.clone();
-                {
-                    std::lock_guard<std::mutex> lock(queue_mutex_);
-                    if (frame_publish_queue_.size() < max_queue_size_) {
-                        frame_publish_queue_.push(frame_copy);
-                    }
+                // Apply frame skipping after decoding
+                bool should_publish = true;
+                
+                if (skip_frame_ > 0 && !i_frame_only_) {
+                    // Skip frame logic (only when not in i_frame_only mode)
+                    should_publish = (frame_counter_++ % (skip_frame_ + 1) == 0);
                 }
-                queue_cv_.notify_one();
+                
+                if (should_publish) {
+                    cv::Mat frame_copy = bgr_frame_.clone();
+                    {
+                        std::lock_guard<std::mutex> lock(queue_mutex_);
+                        if (frame_publish_queue_.size() < max_queue_size_) {
+                            frame_publish_queue_.push(frame_copy);
+                        }
+                    }
+                    queue_cv_.notify_one();
+                }
             }
             
             av_frame_unref(hw_frame_);
@@ -281,18 +295,31 @@ private:
             remaining_size -= bytes_parsed;
 
             if (pkt_->size > 0) {
-                DecodeAndDisplayPacket(pkt_);
+                // Check if this is an I-frame when i_frame_only mode is enabled
+                if (i_frame_only_) {
+                    // Parse NAL unit type from H.264 stream
+                    // The parser sets keyframe flag for I-frames
+                    if (parser_ctx_->key_frame == 1) {
+                        DecodeAndDisplayPacket(pkt_);
+                    }
+                } else {
+                    DecodeAndDisplayPacket(pkt_);
+                }
             }
         }
     }
 
 public:
     H264DecoderNode() : Node("h264_decoder_node") {
-        this->declare_parameter("subscribe_topic", "/dual_fisheye/image/compressed");
-        this->declare_parameter("publish_topic", "/dual_fisheye/image");
+        this->declare_parameter("compressed_topic", "/dual_fisheye/image/compressed");
+        this->declare_parameter("uncompressed_topic", "/dual_fisheye/image");
+        this->declare_parameter("skip_frame", 0);
+        this->declare_parameter("i_frame_only", false);
 
-        std::string subscribe_topic = this->get_parameter("subscribe_topic").as_string();
-        std::string publish_topic = this->get_parameter("publish_topic").as_string();
+        std::string subscribe_topic = this->get_parameter("compressed_topic").as_string();
+        std::string publish_topic = this->get_parameter("uncompressed_topic").as_string();
+        skip_frame_ = this->get_parameter("skip_frame").as_int();
+        i_frame_only_ = this->get_parameter("i_frame_only").as_bool();
 
         subscription_ = this->create_subscription<sensor_msgs::msg::CompressedImage>(
             subscribe_topic, 10,
@@ -307,6 +334,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "H.264 Decoder Node initialized");
         RCLCPP_INFO(this->get_logger(), "Subscribing to: %s", subscribe_topic.c_str());
         RCLCPP_INFO(this->get_logger(), "Publishing to: %s", publish_topic.c_str());
+        RCLCPP_INFO(this->get_logger(), "Skip frame: %d, I-frame only: %s", skip_frame_, i_frame_only_ ? "true" : "false");
     }
 
     ~H264DecoderNode() {
