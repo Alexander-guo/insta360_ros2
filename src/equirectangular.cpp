@@ -25,7 +25,7 @@ EquirectangularNode::EquirectangularNode()
     loadParameters();
     
     // Log GPU settings (note: C++ version currently only supports CPU)
-    RCLCPP_INFO(get_logger(), "C++ equirectangular node - CPU processing only (GPU via Python node)");
+    RCLCPP_INFO(get_logger(), "C++ equirectangular node");
     
     
     // Add parameter callback
