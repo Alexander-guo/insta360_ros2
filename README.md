@@ -6,7 +6,7 @@ A ROS driver for the Insta360 cameras. This driver is tested on Ubuntu 22.04 wit
 - 2304 x 1152
 - 1920 x 960
 
-You can change [this line](https://github.com/ai4ce/insta360_ros_driver/blob/6b0df68ad5bd8d1dca29946bf0e75e3895364ab1/src/main.cpp#L126) to edit the resolution.
+You can change [this line](https://github.com/ai4ce/insta360_ros_driver/blob/79588d9e0e9d029c3371d4095ea718daaf1e06fb/src/main.cpp#L126) to edit the resolution.
 
 ## Installation
 To use this driver, you need to first have Insta360 SDK. Please apply for the SDK from the [Insta360 website](https://www.insta360.com/sdk/home). 
