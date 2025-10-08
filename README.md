@@ -11,6 +11,8 @@ You can change [this line](https://github.com/ai4ce/insta360_ros_driver/blob/795
 ## Installation
 To use this driver, you need to first have Insta360 SDK. Please apply for the SDK from the [Insta360 website](https://www.insta360.com/sdk/home). 
 
+For additional instructions, see this [post](https://github.com/ai4ce/insta360_ros_driver/issues/10#issuecomment-3371481987).
+
 **Note: Please make you use the latest SDK. This package works with the SDK posted after April 23, 2025**
 
 ```
