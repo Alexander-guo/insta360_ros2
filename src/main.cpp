@@ -121,7 +121,7 @@ public:
         cam->SetStreamDelegate(delegate);
 
         auto start = time(NULL);
-        cam->SyncLocalTimeToCamera(start);        
+        cam->SyncLocalTimeToCamera(start, 0);        
         ins_camera::LiveStreamParam param;
         param.video_resolution = ins_camera::VideoResolution::RES_1920_960P30; //Change this line to edit the resolution
         //Possible resolutions (results may vary per model) are:
