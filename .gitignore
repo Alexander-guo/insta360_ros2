@@ -1,6 +1,6 @@
 bag/*
 image_capture/*
-lib/*
+# lib/*
 example/*
 # include/camera/*
 # include/stream/*
