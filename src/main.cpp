@@ -148,6 +148,12 @@ int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
     auto node = rclcpp::Node::make_shared("insta_publisher");
     
+    // // Enable SDK logging for debugging
+    // std::string log_path = std::string(getenv("HOME")) + "/.insta360_sdk.log";
+    // ins_camera::SetLogPath(log_path);
+    // ins_camera::SetLogLevel(ins_camera::VERBOSE);
+    // RCLCPP_INFO(node->get_logger(), "SDK logging enabled to %s", log_path.c_str());
+    
     CameraWrapper camera(node);
     if (camera.run_camera() != 0) {
         rclcpp::shutdown();
