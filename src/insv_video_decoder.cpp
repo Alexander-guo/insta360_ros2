@@ -177,6 +177,7 @@ bool InsvVideoDecoder::decode_all(std::vector<DecodedFrame>& out_frames, std::st
     }
 
     // If there is only one video stream, split the side-by-side frame into rear/front halves. 
+    // TODO: remove this split logic for single stream INSV files.
     if (video_stream_count == 1) {
         for (const auto& rf : stream_a) {
             DecodedFrame df;
@@ -193,8 +194,8 @@ bool InsvVideoDecoder::decode_all(std::vector<DecodedFrame>& out_frames, std::st
         size_t paired = std::min(stream_a.size(), stream_b.size());
         for (size_t i = 0; i < paired; ++i) {
             DecodedFrame df;
-            df.rear = stream_a[i].image;
-            df.front = stream_b[i].image;
+            df.front = stream_a[i].image;
+            df.rear = stream_b[i].image;
             df.t_video = std::min(stream_a[i].t_video, stream_b[i].t_video);
             out_frames.push_back(std::move(df));
         }
