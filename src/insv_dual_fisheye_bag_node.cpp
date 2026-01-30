@@ -1,7 +1,11 @@
 #include "insv/insta360_trailer_parser.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <memory>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <cv_bridge/cv_bridge.hpp>
 #include <sensor_msgs/image_encodings.hpp>
@@ -25,6 +29,8 @@ public:
         declare_parameter<std::string>("frame_id_front", "front_frame");
         declare_parameter<std::string>("frame_id_rear", "rear_frame");
         declare_parameter<std::string>("imu_frame_id", "imu_frame");
+        declare_parameter<bool>("compressed_images", true);
+        declare_parameter<std::string>("image_transport_format", "jpeg");
 
         file_path_ = get_parameter("file_path").as_string();
         bag_path_ = get_parameter("bag_path").as_string();
@@ -34,6 +40,8 @@ public:
         frame_id_front_ = get_parameter("frame_id_front").as_string();
         frame_id_rear_ = get_parameter("frame_id_rear").as_string();
         imu_frame_id_ = get_parameter("imu_frame_id").as_string();
+        compressed_images_ = get_parameter("compressed_images").as_bool();
+        image_transport_format_ = get_parameter("image_transport_format").as_string();
 
         if (file_path_.empty() || bag_path_.empty()) {
             RCLCPP_ERROR(get_logger(), "Parameters 'file_path' and 'bag_path' are required");
@@ -60,6 +68,15 @@ public:
                 imu_samples_.push_back(s);
             }
         }
+        if (!video_ts_sec_.empty()) {
+            std::sort(video_ts_sec_.begin(), video_ts_sec_.end());
+            video_ts_sec_.erase(std::unique(video_ts_sec_.begin(), video_ts_sec_.end()), video_ts_sec_.end());
+        }
+        if (!imu_samples_.empty()) {
+            std::sort(imu_samples_.begin(), imu_samples_.end(), [](const insta360_insv::ImuSample& lhs, const insta360_insv::ImuSample& rhs) {
+                return lhs.time_sec < rhs.time_sec;
+            });
+        }
         if (video_ts_sec_.empty()) {
             RCLCPP_WARN(get_logger(), "No video timestamps (0x600) found; alignment will use zero offset");
         }
@@ -85,17 +102,31 @@ private:
             writer_.open(storage_options, converter_options);
 
             // Create topics
-            rosbag2_storage::TopicMetadata meta_front;
-            meta_front.name = front_topic_;
-            meta_front.type = "sensor_msgs/msg/Image";
-            meta_front.serialization_format = rmw_get_serialization_format();
-            writer_.create_topic(meta_front);
+            if (compressed_images_) {
+                rosbag2_storage::TopicMetadata meta_front;
+                meta_front.name = front_topic_ + "/compressed";
+                meta_front.type = "sensor_msgs/msg/CompressedImage";
+                meta_front.serialization_format = rmw_get_serialization_format();
+                writer_.create_topic(meta_front);
 
-            rosbag2_storage::TopicMetadata meta_rear;
-            meta_rear.name = rear_topic_;
-            meta_rear.type = "sensor_msgs/msg/Image";
-            meta_rear.serialization_format = rmw_get_serialization_format();
-            writer_.create_topic(meta_rear);
+                rosbag2_storage::TopicMetadata meta_rear;
+                meta_rear.name = rear_topic_ + "/compressed";
+                meta_rear.type = "sensor_msgs/msg/CompressedImage";
+                meta_rear.serialization_format = rmw_get_serialization_format();
+                writer_.create_topic(meta_rear);
+            } else {
+                rosbag2_storage::TopicMetadata meta_front;
+                meta_front.name = front_topic_;
+                meta_front.type = "sensor_msgs/msg/Image";
+                meta_front.serialization_format = rmw_get_serialization_format();
+                writer_.create_topic(meta_front);
+
+                rosbag2_storage::TopicMetadata meta_rear;
+                meta_rear.name = rear_topic_;
+                meta_rear.type = "sensor_msgs/msg/Image";
+                meta_rear.serialization_format = rmw_get_serialization_format();
+                writer_.create_topic(meta_rear);
+            }
 
             rosbag2_storage::TopicMetadata meta_imu;
             meta_imu.name = imu_topic_;
@@ -111,9 +142,20 @@ private:
 
     void WriteImuSamples() {
         rclcpp::Serialization<sensor_msgs::msg::Imu> serializer;
+        size_t skipped = 0;
         for (const auto& s : imu_samples_) {
+            if (!std::isfinite(s.time_sec)) {
+                skipped++;
+                continue;
+            }
+            const int64_t stamp_ns = static_cast<int64_t>(s.time_sec * 1e9);
+            if (stamp_ns < 0) {
+                skipped++;
+                continue;
+            }
+            const rclcpp::Time stamp(stamp_ns);
             sensor_msgs::msg::Imu msg;
-            msg.header.stamp = rclcpp::Time(static_cast<int64_t>(s.time_sec * 1e9));
+            msg.header.stamp = stamp;
             msg.header.frame_id = imu_frame_id_;
 
             msg.angular_velocity.x = s.gx;
@@ -132,9 +174,14 @@ private:
 
             rclcpp::SerializedMessage serialized;
             serializer.serialize_message(&msg, &serialized);
-            writer_.write(imu_topic_, serialized, msg.header.stamp.nanoseconds());
+            std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
+                std::make_shared<rclcpp::SerializedMessage>(serialized);
+            writer_.write(serialized_ptr, imu_topic_, "sensor_msgs/msg/Imu", stamp);
         }
-        RCLCPP_INFO(get_logger(), "Wrote %zu IMU samples", imu_samples_.size());
+        if (skipped > 0) {
+            RCLCPP_WARN(get_logger(), "Skipped %zu IMU samples with invalid timestamps", skipped);
+        }
+        RCLCPP_INFO(get_logger(), "Wrote %zu IMU samples", imu_samples_.size() - skipped);
     }
 
     void DecodeAndWriteVideo() {
@@ -153,40 +200,105 @@ private:
 
         double offset_sec = 0.0;
         if (!frames.empty() && !video_ts_sec_.empty()) {
-            offset_sec = frames.front().t_video - video_ts_sec_.front();
-            RCLCPP_INFO(get_logger(), "Computed offset_sec=%.6f (t_video=%.6f, trailer_ts=%.6f)", offset_sec, frames.front().t_video, video_ts_sec_.front());
+            const double base_ts = video_ts_sec_.front();
+            offset_sec = frames.front().t_video - base_ts;
+            RCLCPP_INFO(get_logger(), "Computed offset_sec=%.6f (t_video=%.6f, trailer_ts=%.6f)", offset_sec, frames.front().t_video, base_ts);
         }
 
+        const std::string rear_topic_to_write = compressed_images_ ? rear_topic_ + "/compressed" : rear_topic_;
+        const std::string front_topic_to_write = compressed_images_ ? front_topic_ + "/compressed" : front_topic_;
+
         rclcpp::Serialization<sensor_msgs::msg::Image> img_serializer;
+        rclcpp::Serialization<sensor_msgs::msg::CompressedImage> compressed_serializer;
         int64_t frame_idx = 0;
+        size_t skipped_frames = 0;
         for (const auto& f : frames) {
-            rclcpp::Time stamp(static_cast<int64_t>((f.t_video - offset_sec) * 1e9));
+            const double stamp_sec = f.t_video - offset_sec;
+            if (!std::isfinite(stamp_sec)) {
+                skipped_frames++;
+                continue;
+            }
+            const int64_t stamp_ns = static_cast<int64_t>(stamp_sec * 1e9);
+            if (stamp_ns < 0) {
+                skipped_frames++;
+                continue;
+            }
+            rclcpp::Time stamp(stamp_ns);
 
             // rear
             {
-                std_msgs::msg::Header header;
-                header.stamp = stamp;
-                header.frame_id = frame_id_rear_;
-                cv_bridge::CvImage cv_img(header, sensor_msgs::image_encodings::BGR8, f.rear);
-                sensor_msgs::msg::Image msg;
-                cv_img.toImageMsg(msg);
-                rclcpp::SerializedMessage serialized;
-                img_serializer.serialize_message(&msg, &serialized);
-                writer_.write(rear_topic_, serialized, msg.header.stamp.nanoseconds());
+                if (compressed_images_) {
+                    sensor_msgs::msg::CompressedImage msg;
+                    msg.header.stamp = stamp;
+                    msg.header.frame_id = frame_id_rear_;
+                    msg.format = image_transport_format_;
+                    std::vector<int> params;
+                    if (image_transport_format_ == "jpeg" || image_transport_format_ == "jpg") {
+                        params = { cv::IMWRITE_JPEG_QUALITY, 90 };
+                        msg.format = "jpeg";
+                    } else if (image_transport_format_ == "png") {
+                        params = { cv::IMWRITE_PNG_COMPRESSION, 3 };
+                        msg.format = "png";
+                    }
+                    cv::imencode("." + msg.format, f.rear, msg.data, params);
+                    rclcpp::SerializedMessage serialized;
+                    compressed_serializer.serialize_message(&msg, &serialized);
+                    std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
+                        std::make_shared<rclcpp::SerializedMessage>(serialized);
+                    writer_.write(serialized_ptr, rear_topic_to_write, "sensor_msgs/msg/CompressedImage", stamp);
+                } else {
+                    std_msgs::msg::Header header;
+                    header.stamp = stamp;
+                    header.frame_id = frame_id_rear_;
+                    cv_bridge::CvImage cv_img(header, sensor_msgs::image_encodings::BGR8, f.rear);
+                    sensor_msgs::msg::Image msg;
+                    cv_img.toImageMsg(msg);
+                    rclcpp::SerializedMessage serialized;
+                    img_serializer.serialize_message(&msg, &serialized);
+                    std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
+                        std::make_shared<rclcpp::SerializedMessage>(serialized);
+                    writer_.write(serialized_ptr, rear_topic_to_write, "sensor_msgs/msg/Image", stamp);
+                }
             }
             // front
             {
-                std_msgs::msg::Header header;
-                header.stamp = stamp;
-                header.frame_id = frame_id_front_;
-                cv_bridge::CvImage cv_img(header, sensor_msgs::image_encodings::BGR8, f.front);
-                sensor_msgs::msg::Image msg;
-                cv_img.toImageMsg(msg);
-                rclcpp::SerializedMessage serialized;
-                img_serializer.serialize_message(&msg, &serialized);
-                writer_.write(front_topic_, serialized, msg.header.stamp.nanoseconds());
+                if (compressed_images_) {
+                    sensor_msgs::msg::CompressedImage msg;
+                    msg.header.stamp = stamp;
+                    msg.header.frame_id = frame_id_front_;
+                    msg.format = image_transport_format_;
+                    std::vector<int> params;
+                    if (image_transport_format_ == "jpeg" || image_transport_format_ == "jpg") {
+                        params = { cv::IMWRITE_JPEG_QUALITY, 90 };
+                        msg.format = "jpeg";
+                    } else if (image_transport_format_ == "png") {
+                        params = { cv::IMWRITE_PNG_COMPRESSION, 3 };
+                        msg.format = "png";
+                    }
+                    cv::imencode("." + msg.format, f.front, msg.data, params);
+                    rclcpp::SerializedMessage serialized;
+                    compressed_serializer.serialize_message(&msg, &serialized);
+                    std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
+                        std::make_shared<rclcpp::SerializedMessage>(serialized);
+                    writer_.write(serialized_ptr, front_topic_to_write, "sensor_msgs/msg/CompressedImage", stamp);
+                } else {
+                    std_msgs::msg::Header header;
+                    header.stamp = stamp;
+                    header.frame_id = frame_id_front_;
+                    cv_bridge::CvImage cv_img(header, sensor_msgs::image_encodings::BGR8, f.front);
+                    sensor_msgs::msg::Image msg;
+                    cv_img.toImageMsg(msg);
+                    rclcpp::SerializedMessage serialized;
+                    img_serializer.serialize_message(&msg, &serialized);
+                    std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
+                        std::make_shared<rclcpp::SerializedMessage>(serialized);
+                    writer_.write(serialized_ptr, front_topic_to_write, "sensor_msgs/msg/Image", stamp);
+                }
             }
             frame_idx++;
+        }
+        if (skipped_frames > 0) {
+            RCLCPP_WARN(get_logger(), "Skipped %zu frames with invalid timestamps", skipped_frames);
         }
         RCLCPP_INFO(get_logger(), "Wrote %ld video frames (front+rear)", (long)frame_idx);
     }
@@ -204,6 +316,9 @@ private:
     // Trailer data
     std::vector<double> video_ts_sec_;
     std::vector<insta360_insv::ImuSample> imu_samples_;
+
+    bool compressed_images_{false};
+    std::string image_transport_format_ = "jpeg";
 
     rosbag2_cpp::Writer writer_;
 };
