@@ -9,7 +9,10 @@
 namespace insta360_insv {
 
 struct ImuSample {
-    double time_sec{0.0};
+    // Final aligned time in seconds (after matching to video timestamps).
+    double time_sec{std::numeric_limits<double>::quiet_NaN()};
+    // Raw IMU timestamp (unknown unit/base), stored unscaled.
+    double raw_time{std::numeric_limits<double>::quiet_NaN()};
     double ax{0.0};
     double ay{0.0};
     double az{0.0};
@@ -36,6 +39,7 @@ private:
     static double ReadF64LE(const uint8_t* data);
 
     bool ParseTrailer(const std::vector<uint8_t>& trailer, std::vector<ImuSample>& out_samples, std::string* error_out) const;
+    bool ScanTailForRecords(const std::string& path, std::streamoff file_size, std::vector<ImuSample>& out_samples, std::string* error_out) const;
     void ParseImuRecord(uint16_t id, const uint8_t* data, size_t len, std::vector<ImuSample>& out_samples) const;
     void ParseVideoTimestampRecord(uint16_t id, const uint8_t* data, size_t len, std::vector<ImuSample>& out_samples) const;
 };

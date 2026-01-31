@@ -63,22 +63,135 @@ public:
         }
         for (const auto& s : trailer_samples) {
             if (s.is_video_ts) {
-                video_ts_sec_.push_back(s.video_ts_sec);
+                video_ts_raw_.push_back(s.raw_time);
             } else {
                 imu_samples_.push_back(s);
             }
         }
-        if (!video_ts_sec_.empty()) {
-            std::sort(video_ts_sec_.begin(), video_ts_sec_.end());
-            video_ts_sec_.erase(std::unique(video_ts_sec_.begin(), video_ts_sec_.end()), video_ts_sec_.end());
+        // Stats on IMU record encoding
+        if (!imu_samples_.empty()) {
+            size_t hp = 0, sp = 0;
+            for (const auto& s : imu_samples_) {
+                if (s.high_precision) hp++; else sp++;
+            }
+            RCLCPP_INFO(get_logger(), "IMU records parsed: %zu total (double=%zu, short=%zu)", imu_samples_.size(), hp, sp);
+        }
+        if (!video_ts_raw_.empty()) {
+            std::sort(video_ts_raw_.begin(), video_ts_raw_.end());
+            video_ts_raw_.erase(std::unique(video_ts_raw_.begin(), video_ts_raw_.end()), video_ts_raw_.end());
         }
         if (!imu_samples_.empty()) {
             std::sort(imu_samples_.begin(), imu_samples_.end(), [](const insta360_insv::ImuSample& lhs, const insta360_insv::ImuSample& rhs) {
-                return lhs.time_sec < rhs.time_sec;
+                return lhs.raw_time < rhs.raw_time;
             });
         }
-        if (video_ts_sec_.empty()) {
+        if (video_ts_raw_.empty()) {
             RCLCPP_WARN(get_logger(), "No video timestamps (0x600) found; alignment will use zero offset");
+        }
+
+        // Align IMU raw timestamps to video timestamps with robust filtering.
+        if (!imu_samples_.empty()) {
+            // Determine video timestamp scale and duration if available
+            double video_scale = std::numeric_limits<double>::quiet_NaN();
+            double video_start_sec = std::numeric_limits<double>::quiet_NaN();
+            double video_dur = std::numeric_limits<double>::quiet_NaN();
+            if (!video_ts_raw_.empty()) {
+                const double vmin = video_ts_raw_.front();
+                const double vmax = video_ts_raw_.back();
+                const double vspan = std::max(0.0, vmax - vmin);
+                // Heuristic: microseconds if span > 1e6, else milliseconds
+                video_scale = (vspan > 1e6 ? 1e-6 : 1e-3);
+                video_start_sec = vmin * video_scale;
+                video_dur = vspan * video_scale;
+            }
+            // Build a list of plausible raw times to infer scale (reject extremes poisoning span)
+            std::vector<double> valid_raw;
+            valid_raw.reserve(imu_samples_.size());
+            for (const auto& s : imu_samples_) {
+                if (std::isfinite(s.raw_time) && s.raw_time > 0.0 && s.raw_time < 1e12) {
+                    valid_raw.push_back(s.raw_time);
+                }
+            }
+            double min_raw = imu_samples_.front().raw_time;
+            double max_raw = imu_samples_.front().raw_time;
+            if (!valid_raw.empty()) {
+                auto [mn_it, mx_it] = std::minmax_element(valid_raw.begin(), valid_raw.end());
+                min_raw = *mn_it;
+                max_raw = *mx_it;
+            } else {
+                for (const auto& s : imu_samples_) {
+                    if (s.raw_time < min_raw) min_raw = s.raw_time;
+                    if (s.raw_time > max_raw) max_raw = s.raw_time;
+                }
+            }
+            const double span = max_raw - min_raw;
+            if (std::isfinite(video_scale)) {
+                imu_time_scale_ = video_scale;
+            } else {
+                imu_time_scale_ = (span > 1e6 ? 1e-6 : 1e-3);
+            }
+
+            // Estimate offset to anchor IMU start to video start (first valid IMU)
+            imu_time_offset_ = 0.0;
+            if (std::isfinite(video_start_sec)) {
+                double imu_ref = std::numeric_limits<double>::quiet_NaN();
+                for (const auto& s : imu_samples_) {
+                    if (s.raw_time > 0.0 && s.raw_time < 1e16) { // sanity
+                        imu_ref = s.raw_time * imu_time_scale_;
+                        break;
+                    }
+                }
+                if (std::isfinite(imu_ref)) {
+                    imu_time_offset_ = video_start_sec - imu_ref;
+                }
+            }
+
+            // Filter by duration bound and monotonicity on raw_time; then compute aligned time
+            const double video_min = std::isfinite(video_start_sec) ? video_start_sec : std::numeric_limits<double>::quiet_NaN();
+            const double video_max = (std::isfinite(video_start_sec) && std::isfinite(video_dur)) ? (video_start_sec + video_dur) : std::numeric_limits<double>::quiet_NaN();
+
+            std::vector<insta360_insv::ImuSample> cleaned;
+            cleaned.reserve(imu_samples_.size());
+            size_t dropped_ts_range = 0;
+            size_t dropped_non_mono = 0;
+            double last_raw = -1.0;
+            for (const auto& s : imu_samples_) {
+                const double rt = s.raw_time;
+                if (!(rt > 0.0 && std::isfinite(rt))) {
+                    ++dropped_ts_range;
+                    continue;
+                }
+                if (rt < min_raw || rt > max_raw) {
+                    ++dropped_ts_range;
+                    continue;
+                }
+                if (std::isfinite(video_dur)) {
+                    const double sec_rel = rt * imu_time_scale_;
+                    if (!(sec_rel >= -0.5 && sec_rel <= video_dur * 1.2)) { // small tolerance for pre/post roll
+                        ++dropped_ts_range;
+                        continue;
+                    }
+                }
+                if (last_raw >= 0.0 && rt <= last_raw) {
+                    ++dropped_non_mono;
+                    continue;
+                }
+                last_raw = rt;
+                cleaned.push_back(s);
+            }
+
+            if (!cleaned.empty()) {
+                imu_samples_.swap(cleaned);
+            }
+
+            for (auto& s : imu_samples_) {
+                s.time_sec = s.raw_time * imu_time_scale_ + imu_time_offset_;
+            }
+
+            RCLCPP_INFO(get_logger(),
+                        "IMU time alignment: raw_min=%.3f raw_max=%.3f span=%.3f scale=%.6g offset=%.6f video_start=%.6f video_dur=%.3f dropped_range=%zu dropped_nonmono=%zu kept=%zu",
+                        min_raw, max_raw, span, imu_time_scale_, imu_time_offset_,
+                        video_min, std::isfinite(video_dur) ? video_dur : -1.0, dropped_ts_range, dropped_non_mono, imu_samples_.size());
         }
 
         // Write IMU samples first
@@ -143,16 +256,33 @@ private:
     void WriteImuSamples() {
         rclcpp::Serialization<sensor_msgs::msg::Imu> serializer;
         size_t skipped = 0;
+        size_t reason_not_finite = 0;
+        size_t reason_negative = 0;
+        size_t logged_examples = 0;
         for (const auto& s : imu_samples_) {
             if (!std::isfinite(s.time_sec)) {
                 skipped++;
+                reason_not_finite++;
+                if (logged_examples < 10) {
+                    RCLCPP_WARN(get_logger(),
+                                "Skip IMU: non-finite time_sec (raw=%.3f, scale=%.6g, offset=%.6f)",
+                                s.raw_time, imu_time_scale_, imu_time_offset_);
+                    logged_examples++;
+                }
+                continue;
+            }
+            if (!(s.time_sec >= -1.0 && s.time_sec <= (static_cast<double>(std::numeric_limits<int64_t>::max())/1e9))) {
+                skipped++;
+                reason_negative++;
+                if (logged_examples < 10) {
+                    RCLCPP_WARN(get_logger(),
+                                "Skip IMU: out-of-range stamp (time_sec=%.6f raw=%.3f scale=%.6g offset=%.6f)",
+                                s.time_sec, s.raw_time, imu_time_scale_, imu_time_offset_);
+                    logged_examples++;
+                }
                 continue;
             }
             const int64_t stamp_ns = static_cast<int64_t>(s.time_sec * 1e9);
-            if (stamp_ns < 0) {
-                skipped++;
-                continue;
-            }
             const rclcpp::Time stamp(stamp_ns);
             sensor_msgs::msg::Imu msg;
             msg.header.stamp = stamp;
@@ -199,8 +329,12 @@ private:
         }
 
         double offset_sec = 0.0;
-        if (!frames.empty() && !video_ts_sec_.empty()) {
-            const double base_ts = video_ts_sec_.front();
+        if (!frames.empty() && !video_ts_raw_.empty()) {
+            const double vmin = video_ts_raw_.front();
+            const double vmax = video_ts_raw_.back();
+            const double vspan = std::max(0.0, vmax - vmin);
+            const double vscale = (vspan > 1e6 ? 1e-6 : 1e-3);
+            const double base_ts = vmin * vscale;
             offset_sec = frames.front().t_video - base_ts;
             RCLCPP_INFO(get_logger(), "Computed offset_sec=%.6f (t_video=%.6f, trailer_ts=%.6f)", offset_sec, frames.front().t_video, base_ts);
         }
@@ -314,11 +448,15 @@ private:
     std::string imu_frame_id_;
 
     // Trailer data
-    std::vector<double> video_ts_sec_;
+    std::vector<double> video_ts_raw_;
     std::vector<insta360_insv::ImuSample> imu_samples_;
 
     bool compressed_images_{false};
     std::string image_transport_format_ = "jpeg";
+
+    // Alignment parameters
+    double imu_time_scale_{1e-3};
+    double imu_time_offset_{0.0};
 
     rosbag2_cpp::Writer writer_;
 };
