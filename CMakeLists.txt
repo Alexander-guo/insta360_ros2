@@ -109,21 +109,6 @@ install(TARGETS equirectangular_cpp
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# INSV IMU parser node
-add_executable(insv_imu_parser_node src/insv_imu_node.cpp)
-ament_target_dependencies(insv_imu_parser_node
-  rclcpp
-  sensor_msgs
-  rosbag2_cpp
-  rosbag2_storage
-  rmw
-)
-target_link_libraries(insv_imu_parser_node insta360_trailer_parser)
-
-install(TARGETS insv_imu_parser_node
-  DESTINATION lib/${PROJECT_NAME}
-)
-
 # INSV dual-fisheye bag writer node
 add_executable(insv_dual_fisheye_bag_node src/insv_dual_fisheye_bag_node.cpp)
 ament_target_dependencies(insv_dual_fisheye_bag_node
