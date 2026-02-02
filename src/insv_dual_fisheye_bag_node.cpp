@@ -31,6 +31,7 @@ public:
         declare_parameter<std::string>("imu_frame_id", "imu_frame");
         declare_parameter<bool>("compressed_images", true);
         declare_parameter<std::string>("image_transport_format", "jpeg");
+        declare_parameter<std::string>("storage_id", "db3");
 
         file_path_ = get_parameter("file_path").as_string();
         bag_path_ = get_parameter("bag_path").as_string();
@@ -42,6 +43,16 @@ public:
         imu_frame_id_ = get_parameter("imu_frame_id").as_string();
         compressed_images_ = get_parameter("compressed_images").as_bool();
         image_transport_format_ = get_parameter("image_transport_format").as_string();
+        storage_id_param_ = get_parameter("storage_id").as_string();
+        // Map user-friendly values to rosbag2 storage IDs
+        if (storage_id_param_ == "db3" || storage_id_param_ == "sqlite" || storage_id_param_ == "sqlite3") {
+            storage_id_param_ = "sqlite3";
+        } else if (storage_id_param_ == "mcap" || storage_id_param_ == "MCAP") {
+            storage_id_param_ = "mcap";
+        } else {
+            RCLCPP_WARN(get_logger(), "Unknown storage_id '%s', defaulting to sqlite3", storage_id_param_.c_str());
+            storage_id_param_ = "sqlite3";
+        }
 
         if (file_path_.empty() || bag_path_.empty()) {
             RCLCPP_ERROR(get_logger(), "Parameters 'file_path' and 'bag_path' are required");
@@ -206,7 +217,7 @@ private:
         try {
             rosbag2_storage::StorageOptions storage_options;
             storage_options.uri = bag_path_;
-            storage_options.storage_id = "sqlite3";
+            storage_options.storage_id = storage_id_param_;
 
             rosbag2_cpp::ConverterOptions converter_options;
             converter_options.input_serialization_format = rmw_get_serialization_format();
@@ -453,6 +464,7 @@ private:
 
     bool compressed_images_{false};
     std::string image_transport_format_ = "jpeg";
+    std::string storage_id_param_ = "sqlite3";
 
     // Alignment parameters
     double imu_time_scale_{1e-3};
