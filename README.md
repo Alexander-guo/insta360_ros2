@@ -39,7 +39,7 @@ source install/setup.bash
 ```
 
 ***
-### The following setup for device installation is only for `Livestream Extractor`:
+### The following setup for device mounting is only for `Livestream Extractor`:
 
 Before continuing, **make sure the camera is set to dual-lens mode**.
 
