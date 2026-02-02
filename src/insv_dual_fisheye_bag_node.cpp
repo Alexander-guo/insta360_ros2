@@ -32,6 +32,7 @@ public:
         declare_parameter<bool>("compressed_images", true);
         declare_parameter<std::string>("image_transport_format", "jpeg");
         declare_parameter<std::string>("storage_id", "db3");
+        declare_parameter<double>("time_window_margin_sec", 0.05);
 
         file_path_ = get_parameter("file_path").as_string();
         bag_path_ = get_parameter("bag_path").as_string();
@@ -44,6 +45,8 @@ public:
         compressed_images_ = get_parameter("compressed_images").as_bool();
         image_transport_format_ = get_parameter("image_transport_format").as_string();
         storage_id_param_ = get_parameter("storage_id").as_string();
+        time_window_margin_sec_ = get_parameter("time_window_margin_sec").as_double();
+
         // Map user-friendly values to rosbag2 storage IDs
         if (storage_id_param_ == "db3" || storage_id_param_ == "sqlite" || storage_id_param_ == "sqlite3") {
             storage_id_param_ = "sqlite3";
@@ -100,21 +103,36 @@ public:
             RCLCPP_WARN(get_logger(), "No video timestamps (0x600) found; alignment will use zero offset");
         }
 
+        // Decode frames first to derive reliable video time window from frame PTS
+        {
+            insta360_insv::InsvVideoDecoder decoder(file_path_);
+            std::string derr;
+            if (!decoder.open(&derr)) {
+                RCLCPP_ERROR(get_logger(), "Decoder open failed: %s", derr.c_str());
+                return;
+            }
+
+            if (!decoder.decode_all(frames_, &derr)) {
+                RCLCPP_ERROR(get_logger(), "Decode failed: %s", derr.c_str());
+                return;
+            }
+
+            if (frames_.empty()) {
+                RCLCPP_ERROR(get_logger(), "No video frames decoded; cannot determine video duration");
+                return;
+            }
+
+            // Use decoded frame timestamps as ground truth window
+            video_min_sec_ = frames_.front().t_video;
+            video_max_sec_ = frames_.back().t_video;
+            video_dur_sec_ = std::max(0.0, video_max_sec_ - video_min_sec_);
+        }
+
         // Align IMU raw timestamps to video timestamps with robust filtering.
         if (!imu_samples_.empty()) {
-            // Determine video timestamp scale and duration if available
-            double video_scale = std::numeric_limits<double>::quiet_NaN();
-            double video_start_sec = std::numeric_limits<double>::quiet_NaN();
-            double video_dur = std::numeric_limits<double>::quiet_NaN();
-            if (!video_ts_raw_.empty()) {
-                const double vmin = video_ts_raw_.front();
-                const double vmax = video_ts_raw_.back();
-                const double vspan = std::max(0.0, vmax - vmin);
-                // Heuristic: microseconds if span > 1e6, else milliseconds
-                video_scale = (vspan > 1e6 ? 1e-6 : 1e-3);
-                video_start_sec = vmin * video_scale;
-                video_dur = vspan * video_scale;
-            }
+            // Use video window from decoded frames
+            const double video_start_sec = video_min_sec_;
+            const double video_dur = video_dur_sec_;
             // Build a list of plausible raw times to infer scale (reject extremes poisoning span)
             std::vector<double> valid_raw;
             valid_raw.reserve(imu_samples_.size());
@@ -136,11 +154,8 @@ public:
                 }
             }
             const double span = max_raw - min_raw;
-            if (std::isfinite(video_scale)) {
-                imu_time_scale_ = video_scale;
-            } else {
-                imu_time_scale_ = (span > 1e6 ? 1e-6 : 1e-3);
-            }
+            // Detect IMU scale from its own span only (µs vs ms)
+            imu_time_scale_ = (span > 1e6 ? 1e-6 : 1e-3);
 
             // Estimate offset to anchor IMU start to video start (first valid IMU)
             imu_time_offset_ = 0.0;
@@ -160,6 +175,7 @@ public:
             // Filter by duration bound and monotonicity on raw_time; then compute aligned time
             const double video_min = std::isfinite(video_start_sec) ? video_start_sec : std::numeric_limits<double>::quiet_NaN();
             const double video_max = (std::isfinite(video_start_sec) && std::isfinite(video_dur)) ? (video_start_sec + video_dur) : std::numeric_limits<double>::quiet_NaN();
+            // Keep existing member window (already set from frames)
 
             std::vector<insta360_insv::ImuSample> cleaned;
             cleaned.reserve(imu_samples_.size());
@@ -176,9 +192,10 @@ public:
                     ++dropped_ts_range;
                     continue;
                 }
-                if (std::isfinite(video_dur)) {
-                    const double sec_rel = rt * imu_time_scale_;
-                    if (!(sec_rel >= -0.5 && sec_rel <= video_dur * 1.2)) { // small tolerance for pre/post roll
+                // Use aligned IMU time against absolute video window
+                if (std::isfinite(video_min) && std::isfinite(video_max)) {
+                    const double sec_aligned = rt * imu_time_scale_ + imu_time_offset_;
+                    if (!(sec_aligned >= video_min - time_window_margin_sec_ && sec_aligned <= video_max + time_window_margin_sec_)) {
                         ++dropped_ts_range;
                         continue;
                     }
@@ -199,16 +216,41 @@ public:
                 s.time_sec = s.raw_time * imu_time_scale_ + imu_time_offset_;
             }
 
+            // Drop IMU samples that still fall outside the computed video window after alignment
+            size_t dropped_beyond_window = 0;
+            if (std::isfinite(video_min) && std::isfinite(video_max)) {
+                std::vector<insta360_insv::ImuSample> windowed;
+                windowed.reserve(imu_samples_.size());
+                for (const auto& s : imu_samples_) {
+                    if (s.time_sec < video_min - time_window_margin_sec_ || s.time_sec > video_max + time_window_margin_sec_) {
+                        ++dropped_beyond_window;
+                        continue;
+                    }
+                    windowed.push_back(s);
+                }
+                if (!windowed.empty()) {
+                    imu_samples_.swap(windowed);
+                }
+            }
+
             RCLCPP_INFO(get_logger(),
-                        "IMU time alignment: raw_min=%.3f raw_max=%.3f span=%.3f scale=%.6g offset=%.6f video_start=%.6f video_dur=%.3f dropped_range=%zu dropped_nonmono=%zu kept=%zu",
+                        "IMU time alignment: raw_min=%.3f raw_max=%.3f span=%.3f scale=%.6g offset=%.6f video_start=%.6f video_dur=%.3f dropped_range=%zu dropped_nonmono=%zu dropped_outside=%zu kept=%zu",
                         min_raw, max_raw, span, imu_time_scale_, imu_time_offset_,
-                        video_min, std::isfinite(video_dur) ? video_dur : -1.0, dropped_ts_range, dropped_non_mono, imu_samples_.size());
+                        video_min, std::isfinite(video_dur) ? video_dur : -1.0, dropped_ts_range, dropped_non_mono, dropped_beyond_window, imu_samples_.size());
         }
 
-        // Write IMU samples first
+        double imu_min = imu_samples_.front().time_sec;
+        double imu_max = imu_samples_.back().time_sec;
+
+        RCLCPP_WARN(
+            get_logger(),
+            "FINAL WINDOW: video [%.3f, %.3f], imu [%.3f, %.3f]",
+            video_min_sec_, video_max_sec_, imu_min, imu_max);
+
+        // Write IMU samples first (now clamped to the video window)
         WriteImuSamples();
 
-        // Decode and write dual fisheye frames
+        // Write dual fisheye frames (reuse decoded frames)
         DecodeAndWriteVideo();
     }
 
@@ -269,6 +311,7 @@ private:
         size_t skipped = 0;
         size_t reason_not_finite = 0;
         size_t reason_negative = 0;
+        size_t sanity_warned = 0;
         size_t logged_examples = 0;
         for (const auto& s : imu_samples_) {
             if (!std::isfinite(s.time_sec)) {
@@ -281,6 +324,12 @@ private:
                     logged_examples++;
                 }
                 continue;
+            }
+            if (std::isfinite(video_max_sec_) && s.time_sec > video_max_sec_ + time_window_margin_sec_ && sanity_warned < 10) {
+                RCLCPP_WARN(get_logger(),
+                            "IMU timestamp %.3f exceeds video end + margin (%.3f + %.3f)",
+                            s.time_sec, video_max_sec_, time_window_margin_sec_);
+                ++sanity_warned;
             }
             if (!(s.time_sec >= -1.0 && s.time_sec <= (static_cast<double>(std::numeric_limits<int64_t>::max())/1e9))) {
                 skipped++;
@@ -326,28 +375,20 @@ private:
     }
 
     void DecodeAndWriteVideo() {
-        insta360_insv::InsvVideoDecoder decoder(file_path_);
-        std::string derr;
-        if (!decoder.open(&derr)) {
-            RCLCPP_ERROR(get_logger(), "Decoder open failed: %s", derr.c_str());
-            return;
-        }
-
-        std::vector<insta360_insv::DecodedFrame> frames;
-        if (!decoder.decode_all(frames, &derr)) {
-            RCLCPP_ERROR(get_logger(), "Decode failed: %s", derr.c_str());
+        if (frames_.empty()) {
+            RCLCPP_ERROR(get_logger(), "No decoded frames available to write");
             return;
         }
 
         double offset_sec = 0.0;
-        if (!frames.empty() && !video_ts_raw_.empty()) {
+        if (!frames_.empty() && !video_ts_raw_.empty()) {
             const double vmin = video_ts_raw_.front();
             const double vmax = video_ts_raw_.back();
             const double vspan = std::max(0.0, vmax - vmin);
             const double vscale = (vspan > 1e6 ? 1e-6 : 1e-3);
             const double base_ts = vmin * vscale;
-            offset_sec = frames.front().t_video - base_ts;
-            RCLCPP_INFO(get_logger(), "Computed offset_sec=%.6f (t_video=%.6f, trailer_ts=%.6f)", offset_sec, frames.front().t_video, base_ts);
+            offset_sec = frames_.front().t_video - base_ts;
+            RCLCPP_INFO(get_logger(), "Computed offset_sec=%.6f (t_video=%.6f, trailer_ts=%.6f)", offset_sec, frames_.front().t_video, base_ts);
         }
 
         const std::string rear_topic_to_write = compressed_images_ ? rear_topic_ + "/compressed" : rear_topic_;
@@ -357,7 +398,7 @@ private:
         rclcpp::Serialization<sensor_msgs::msg::CompressedImage> compressed_serializer;
         int64_t frame_idx = 0;
         size_t skipped_frames = 0;
-        for (const auto& f : frames) {
+        for (const auto& f : frames_) {
             const double stamp_sec = f.t_video - offset_sec;
             if (!std::isfinite(stamp_sec)) {
                 skipped_frames++;
@@ -469,6 +510,12 @@ private:
     // Alignment parameters
     double imu_time_scale_{1e-3};
     double imu_time_offset_{0.0};
+    double video_min_sec_{std::numeric_limits<double>::quiet_NaN()};
+    double video_max_sec_{std::numeric_limits<double>::quiet_NaN()};
+    double video_dur_sec_{std::numeric_limits<double>::quiet_NaN()};
+    double time_window_margin_sec_{0.05};
+
+    std::vector<insta360_insv::DecodedFrame> frames_;
 
     rosbag2_cpp::Writer writer_;
 };
