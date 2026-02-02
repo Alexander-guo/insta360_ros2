@@ -44,7 +44,7 @@ The Insta360 requires sudo privilege to be accessed via USB. To compensate for t
 cd ~/ros2_ws/src/insta360_ros_driver
 ./setup.sh
 ```
-This creates a symlink  based on the vendor ID of Insta360 cameras. The symlink, in this case <code>/dev/insta</code> is used to grant permissions to the usb port used by the camera.
+This creates a symlink  based on the vendor ID of Insta360 cameras. The symlink, in this case <code>/dev/insta</code> is used to grant permissions to the usb port used by the camera. **Make sure you run it on your host system if you are in a container!!**
 
 ![setup](docs/setup.png)
 

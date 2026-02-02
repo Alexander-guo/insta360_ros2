@@ -20,6 +20,9 @@ pkg_check_modules(AVCODEC REQUIRED libavcodec)
 pkg_check_modules(AVFORMAT REQUIRED libavformat)
 pkg_check_modules(AVUTIL REQUIRED libavutil)
 pkg_search_module(SWSCALE REQUIRED libswscale)
+find_package(rosbag2_cpp REQUIRED)
+find_package(rosbag2_storage REQUIRED)
+find_package(rmw REQUIRED)
 
 include_directories(
   include
@@ -28,6 +31,27 @@ include_directories(
   ${AVFORMAT_INCLUDE_DIRS}
   ${AVUTIL_INCLUDE_DIRS}
   ${SWSCALE_INCLUDE_DIRS}
+)
+
+add_library(insta360_trailer_parser src/insta360_trailer_parser.cpp)
+
+add_library(insv_video_decoder src/insv_video_decoder.cpp)
+target_link_libraries(insv_video_decoder
+  ${OpenCV_LIBRARIES}
+  ${AVCODEC_LIBRARIES}
+  ${AVFORMAT_LIBRARIES}
+  ${AVUTIL_LIBRARIES}
+  ${SWSCALE_LIBRARIES}
+)
+
+install(TARGETS insta360_trailer_parser
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+install(DIRECTORY include/
+  DESTINATION include
 )
 
 link_directories(
@@ -50,7 +74,7 @@ ament_target_dependencies(${PROJECT_NAME}
   std_srvs
   OpenCV
 )
-target_link_libraries(${PROJECT_NAME} CameraSDK  ${OpenCV_LIBRARIES} ${AVCODEC_LIBRARIES} ${AVFORMAT_LIBRARIES} ${AVUTIL_LIBRARIES} ${SWSCALE_LIBRARIES})
+target_link_libraries(${PROJECT_NAME} CameraSDK insta360_trailer_parser ${OpenCV_LIBRARIES} ${AVCODEC_LIBRARIES} ${AVFORMAT_LIBRARIES} ${AVUTIL_LIBRARIES} ${SWSCALE_LIBRARIES})
 
 install(TARGETS ${PROJECT_NAME}
   DESTINATION lib/${PROJECT_NAME}
@@ -82,6 +106,31 @@ ament_target_dependencies(equirectangular_cpp
 target_link_libraries(equirectangular_cpp ${OpenCV_LIBRARIES})
 
 install(TARGETS equirectangular_cpp
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# INSV dual-fisheye bag writer node
+add_executable(insv_dual_fisheye_bag_node src/insv_dual_fisheye_bag_node.cpp)
+ament_target_dependencies(insv_dual_fisheye_bag_node
+  rclcpp
+  sensor_msgs
+  cv_bridge
+  OpenCV
+  rosbag2_cpp
+  rosbag2_storage
+  rmw
+)
+target_link_libraries(insv_dual_fisheye_bag_node
+  insta360_trailer_parser
+  insv_video_decoder
+  ${OpenCV_LIBRARIES}
+  ${AVCODEC_LIBRARIES}
+  ${AVFORMAT_LIBRARIES}
+  ${AVUTIL_LIBRARIES}
+  ${SWSCALE_LIBRARIES}
+)
+
+install(TARGETS insv_dual_fisheye_bag_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
