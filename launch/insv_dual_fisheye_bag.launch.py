@@ -16,6 +16,7 @@ def generate_launch_description():
     compressed_images = LaunchConfiguration("compressed_images")
     image_transport_format = LaunchConfiguration("image_transport_format")
     storage_id = LaunchConfiguration("storage_id")
+    jpeg_quality = LaunchConfiguration("jpeg_quality")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -71,6 +72,11 @@ def generate_launch_description():
             default_value="db3",
             description="Rosbag2 storage id: 'db3' (sqlite3) or 'mcap'"
         ),
+        DeclareLaunchArgument(
+            "jpeg_quality",
+            default_value="90",
+            description="JPEG encoding quality (1-100). Ignored if image_transport_format is 'png'"
+        ),
         Node(
             package="insta360_ros_driver",
             executable="insv_dual_fisheye_bag_node",
@@ -87,6 +93,7 @@ def generate_launch_description():
                 "compressed_images": compressed_images,
                 "image_transport_format": image_transport_format,
                 "storage_id": storage_id,
+                "jpeg_quality": jpeg_quality,
             }]
         )
     ])

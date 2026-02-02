@@ -18,6 +18,10 @@
 
 #include "insv/insv_video_decoder.hpp"
 
+namespace {
+constexpr double STANDARD_GRAVITY_MS2 = 9.80665;
+}
+
 class InsvDualFisheyeBagNode : public rclcpp::Node {
 public:
     InsvDualFisheyeBagNode() : rclcpp::Node("insv_dual_fisheye_bag_node") {
@@ -33,6 +37,7 @@ public:
         declare_parameter<std::string>("image_transport_format", "jpeg");
         declare_parameter<std::string>("storage_id", "db3");
         declare_parameter<double>("time_window_margin_sec", 0.05);
+        declare_parameter<int>("jpeg_quality", 90);
 
         file_path_ = get_parameter("file_path").as_string();
         bag_path_ = get_parameter("bag_path").as_string();
@@ -46,6 +51,12 @@ public:
         image_transport_format_ = get_parameter("image_transport_format").as_string();
         storage_id_param_ = get_parameter("storage_id").as_string();
         time_window_margin_sec_ = get_parameter("time_window_margin_sec").as_double();
+        {
+            int q = get_parameter("jpeg_quality").as_int();
+            if (q < 1) q = 1;
+            if (q > 100) q = 100;
+            jpeg_quality_ = q;
+        }
 
         // Map user-friendly values to rosbag2 storage IDs
         if (storage_id_param_ == "db3" || storage_id_param_ == "sqlite" || storage_id_param_ == "sqlite3") {
@@ -359,9 +370,9 @@ private:
             msg.angular_velocity.y = s.gy;
             msg.angular_velocity.z = s.gz;
 
-            msg.linear_acceleration.x = s.ax * 9.80665;
-            msg.linear_acceleration.y = s.ay * 9.80665;
-            msg.linear_acceleration.z = s.az * 9.80665;
+            msg.linear_acceleration.x = s.ax * STANDARD_GRAVITY_MS2;
+            msg.linear_acceleration.y = s.ay * STANDARD_GRAVITY_MS2;
+            msg.linear_acceleration.z = s.az * STANDARD_GRAVITY_MS2;
 
             msg.orientation_covariance[0] = -1.0;
             for (int i = 0; i < 9; ++i) {
@@ -427,7 +438,7 @@ private:
                     msg.format = image_transport_format_;
                     std::vector<int> params;
                     if (image_transport_format_ == "jpeg" || image_transport_format_ == "jpg") {
-                        params = { cv::IMWRITE_JPEG_QUALITY, 90 };
+                        params = { cv::IMWRITE_JPEG_QUALITY, jpeg_quality_ };
                         msg.format = "jpeg";
                     } else if (image_transport_format_ == "png") {
                         params = { cv::IMWRITE_PNG_COMPRESSION, 3 };
@@ -462,7 +473,7 @@ private:
                     msg.format = image_transport_format_;
                     std::vector<int> params;
                     if (image_transport_format_ == "jpeg" || image_transport_format_ == "jpg") {
-                        params = { cv::IMWRITE_JPEG_QUALITY, 90 };
+                        params = { cv::IMWRITE_JPEG_QUALITY, jpeg_quality_ };
                         msg.format = "jpeg";
                     } else if (image_transport_format_ == "png") {
                         params = { cv::IMWRITE_PNG_COMPRESSION, 3 };
@@ -521,6 +532,7 @@ private:
     double video_max_sec_{std::numeric_limits<double>::quiet_NaN()};
     double video_dur_sec_{std::numeric_limits<double>::quiet_NaN()};
     double time_window_margin_sec_{0.05};
+    int jpeg_quality_{90};
 
     std::vector<insta360_insv::DecodedFrame> frames_;
 
