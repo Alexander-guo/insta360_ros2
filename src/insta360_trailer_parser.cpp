@@ -323,7 +323,8 @@ void TrailerParser::ParseImuRecord(uint16_t /*id*/, const uint8_t* data, size_t 
             sample.high_precision = true;
         } else {
             // 6x uint16_t, stored after 8-byte timestamp.
-            const uint16_t* raw = reinterpret_cast<const uint16_t*>(rec + 8);
+            uint16_t raw[6];
+            std::memcpy(raw, rec + 8, sizeof(raw));
             const double scale = 1.0 / 1000.0;
             auto convert = [scale](uint16_t v) {
                 return (static_cast<int>(v) - 0x8000) * scale;
