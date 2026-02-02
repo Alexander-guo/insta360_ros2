@@ -239,13 +239,20 @@ public:
                         video_min, std::isfinite(video_dur) ? video_dur : -1.0, dropped_ts_range, dropped_non_mono, dropped_beyond_window, imu_samples_.size());
         }
 
-        double imu_min = imu_samples_.front().time_sec;
-        double imu_max = imu_samples_.back().time_sec;
+        if (!imu_samples_.empty()) {
+            double imu_min = imu_samples_.front().time_sec;
+            double imu_max = imu_samples_.back().time_sec;
 
-        RCLCPP_WARN(
-            get_logger(),
-            "FINAL WINDOW: video [%.3f, %.3f], imu [%.3f, %.3f]",
-            video_min_sec_, video_max_sec_, imu_min, imu_max);
+            RCLCPP_WARN(
+                get_logger(),
+                "FINAL WINDOW: video [%.3f, %.3f], imu [%.3f, %.3f]",
+                video_min_sec_, video_max_sec_, imu_min, imu_max);
+        } else {
+            RCLCPP_WARN(
+                get_logger(),
+                "FINAL WINDOW: video [%.3f, %.3f], imu [no samples remain after filtering]",
+                video_min_sec_, video_max_sec_);
+        }
 
         // Write IMU samples first (now clamped to the video window)
         WriteImuSamples();
