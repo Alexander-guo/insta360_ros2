@@ -31,7 +31,10 @@ colcon build --symlink-install
 source install/setup.bash
 ```
 
-Before continuing, **make sure the camera is set to dual-lens mode**
+***
+### The following setup for device mounting is only for `Livestream Extractor`:
+
+Before continuing, **make sure the camera is set to dual-lens mode**.
 
 Additionally, **ensure the camera's USB mode is set to Android**:
 1. On the camera, swipe down the screen to the main menu
