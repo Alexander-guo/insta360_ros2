@@ -74,7 +74,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "jpeg_quality",
-            default_value="90",
+            default_value="50",
             description="JPEG encoding quality (1-100). Ignored if image_transport_format is 'png'"
         ),
         Node(

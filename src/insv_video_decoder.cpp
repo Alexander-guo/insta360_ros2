@@ -41,6 +41,21 @@ double FrameTimestampSec(const AVFrame* frame, const AVStream* stream) {
     return pts * av_q2d(stream->time_base);
 }
 
+struct PixelFormatInfo {
+    AVPixelFormat fmt;
+    bool full_range;
+};
+
+PixelFormatInfo NormalizePixelFormat(AVPixelFormat fmt) {
+    switch (fmt) {
+        case AV_PIX_FMT_YUVJ420P: return {AV_PIX_FMT_YUV420P, true};
+        case AV_PIX_FMT_YUVJ422P: return {AV_PIX_FMT_YUV422P, true};
+        case AV_PIX_FMT_YUVJ444P: return {AV_PIX_FMT_YUV444P, true};
+        case AV_PIX_FMT_YUVJ440P: return {AV_PIX_FMT_YUV440P, true};
+        default: return {fmt, false};
+    }
+}
+
 } // namespace
 
 bool InsvVideoDecoder::probe_time_window(double& min_sec, double& max_sec, std::string* error_out) {
@@ -304,15 +319,26 @@ bool InsvVideoDecoder::stream_decode(const std::function<bool(DecodedFrame&&)>& 
                 return false;
             }
 
+            PixelFormatInfo fmt_info = NormalizePixelFormat(static_cast<AVPixelFormat>(frame->format));
             state.sws_ctx = sws_getCachedContext(
                 state.sws_ctx,
-                frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
+                frame->width, frame->height, fmt_info.fmt,
                 frame->width, frame->height, AV_PIX_FMT_BGR24,
                 SWS_BILINEAR, nullptr, nullptr, nullptr);
             if (!state.sws_ctx) {
                 if (error_out) *error_out = "Failed to init scaler";
                 return false;
             }
+            const int* coeffs = sws_getCoefficients(AVCOL_SPC_BT709);
+            sws_setColorspaceDetails(
+                state.sws_ctx,
+                coeffs,
+                fmt_info.full_range ? 1 : 0,
+                coeffs,
+                1,
+                0,
+                1 << 16,
+                1 << 16);
 
             cv::Mat bgr(frame->height, frame->width, CV_8UC3);
             uint8_t* dst_data[4] = { bgr.data, nullptr, nullptr, nullptr };
