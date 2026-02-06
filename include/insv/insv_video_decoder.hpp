@@ -15,8 +15,10 @@ struct DecodedFrame {
 
 class InsvVideoDecoder {
 public:
-    explicit InsvVideoDecoder(const std::string& path);
+    explicit InsvVideoDecoder(const std::string& path, int decode_threads = 0);
     ~InsvVideoDecoder();
+
+    void set_decode_threads(int decode_threads);
 
     bool open(std::string* error_out = nullptr);
     bool probe_time_window(double& min_sec, double& max_sec, std::string* error_out = nullptr);
@@ -25,6 +27,7 @@ public:
 
 private:
     std::string path_;
+    int decode_threads_{0};
 };
 
 } // namespace insta360_insv

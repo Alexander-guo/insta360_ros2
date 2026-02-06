@@ -15,8 +15,19 @@ extern "C" {
 
 namespace insta360_insv {
 
-InsvVideoDecoder::InsvVideoDecoder(const std::string& path) : path_(path) {}
+InsvVideoDecoder::InsvVideoDecoder(const std::string& path, int decode_threads)
+    : path_(path) {
+    set_decode_threads(decode_threads);
+}
 InsvVideoDecoder::~InsvVideoDecoder() {}
+
+void InsvVideoDecoder::set_decode_threads(int decode_threads) {
+    if (decode_threads <= 0) {
+        decode_threads_ = 0;
+    } else {
+        decode_threads_ = decode_threads;
+    }
+}
 
 bool InsvVideoDecoder::open(std::string* /*error_out*/) {
     // No persistent open state currently; handled in probe/stream helpers
@@ -53,6 +64,18 @@ PixelFormatInfo NormalizePixelFormat(AVPixelFormat fmt) {
         case AV_PIX_FMT_YUVJ444P: return {AV_PIX_FMT_YUV444P, true};
         case AV_PIX_FMT_YUVJ440P: return {AV_PIX_FMT_YUV440P, true};
         default: return {fmt, false};
+    }
+}
+
+void ConfigureDecoderThreads(AVCodecContext* ctx, int decode_threads) {
+    if (!ctx) {
+        return;
+    }
+    if (decode_threads > 0) {
+        ctx->thread_count = decode_threads;
+        ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    } else {
+        ctx->thread_count = 0; // allow FFmpeg to auto-select
     }
 }
 
@@ -107,6 +130,7 @@ bool InsvVideoDecoder::probe_time_window(double& min_sec, double& max_sec, std::
             avformat_close_input(&fmt_ctx);
             return false;
         }
+        ConfigureDecoderThreads(codec_ctx, decode_threads_);
         if (avcodec_parameters_to_context(codec_ctx, fmt_ctx->streams[i]->codecpar) < 0 ||
             avcodec_open2(codec_ctx, codec, nullptr) < 0) {
             if (error_out) *error_out = "Failed to open codec";
@@ -272,6 +296,7 @@ bool InsvVideoDecoder::stream_decode(const std::function<bool(DecodedFrame&&)>& 
             ok = false;
             break;
         }
+        ConfigureDecoderThreads(codec_ctx, decode_threads_);
         if (avcodec_parameters_to_context(codec_ctx, av_stream->codecpar) < 0 ||
             avcodec_open2(codec_ctx, codec, nullptr) < 0) {
             if (error_out) *error_out = "Failed to open codec";
