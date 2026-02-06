@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 #include <opencv2/opencv.hpp>
@@ -18,7 +19,9 @@ public:
     ~InsvVideoDecoder();
 
     bool open(std::string* error_out = nullptr);
-    bool decode_all(std::vector<DecodedFrame>& out_frames, std::string* error_out = nullptr);
+    bool probe_time_window(double& min_sec, double& max_sec, std::string* error_out = nullptr);
+    bool stream_decode(const std::function<bool(DecodedFrame&&)>& on_frame,
+                      std::string* error_out = nullptr);
 
 private:
     std::string path_;

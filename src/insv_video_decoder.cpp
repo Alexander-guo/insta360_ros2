@@ -1,6 +1,10 @@
 #include "insv/insv_video_decoder.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <deque>
+#include <limits>
+#include <utility>
 
 extern "C" {
     #include <libavcodec/avcodec.h>
@@ -15,24 +19,37 @@ InsvVideoDecoder::InsvVideoDecoder(const std::string& path) : path_(path) {}
 InsvVideoDecoder::~InsvVideoDecoder() {}
 
 bool InsvVideoDecoder::open(std::string* /*error_out*/) {
-    // No persistent open state currently; handled in decode_all()
+    // No persistent open state currently; handled in probe/stream helpers
     return !path_.empty();
 }
 
 namespace {
+
 struct RawFrame {
     double t_video;
     cv::Mat image;
 };
+
+double FrameTimestampSec(const AVFrame* frame, const AVStream* stream) {
+    if (!frame || !stream) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    int64_t pts = (frame->best_effort_timestamp == AV_NOPTS_VALUE) ? frame->pts : frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return pts * av_q2d(stream->time_base);
+}
+
 } // namespace
 
-static bool DecodeStreamOrdinal(const std::string& path,
-                                int video_ordinal,
-                                std::vector<RawFrame>& out_frames,
-                                std::string* error_out) {
+bool InsvVideoDecoder::probe_time_window(double& min_sec, double& max_sec, std::string* error_out) {
+    min_sec = std::numeric_limits<double>::quiet_NaN();
+    max_sec = std::numeric_limits<double>::quiet_NaN();
+
     AVFormatContext* fmt_ctx = nullptr;
-    if (avformat_open_input(&fmt_ctx, path.c_str(), nullptr, nullptr) < 0) {
-        if (error_out) *error_out = "Failed to reopen input";
+    if (avformat_open_input(&fmt_ctx, path_.c_str(), nullptr, nullptr) < 0) {
+        if (error_out) *error_out = "Failed to open input";
         return false;
     }
     if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
@@ -41,167 +58,370 @@ static bool DecodeStreamOrdinal(const std::string& path,
         return false;
     }
 
-    int target_stream = -1;
-    int seen = 0;
-    for (unsigned int i = 0; i < fmt_ctx->nb_streams; ++i) {
-        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            if (seen == video_ordinal) {
-                target_stream = static_cast<int>(i);
-                break;
+    struct ProbeDecoder {
+        int stream_index;
+        AVStream* stream;
+        AVCodecContext* codec_ctx;
+    };
+
+    std::vector<ProbeDecoder> probes;
+    probes.reserve(fmt_ctx->nb_streams);
+    auto free_probe_contexts = [&]() {
+        for (auto& probe_ctx : probes) {
+            if (probe_ctx.codec_ctx) {
+                avcodec_free_context(&probe_ctx.codec_ctx);
+                probe_ctx.codec_ctx = nullptr;
             }
-            ++seen;
         }
+    };
+    for (unsigned int i = 0; i < fmt_ctx->nb_streams; ++i) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
+            continue;
+        }
+        const AVCodec* codec = avcodec_find_decoder(fmt_ctx->streams[i]->codecpar->codec_id);
+        if (!codec) {
+            if (error_out) *error_out = "Decoder not found";
+            free_probe_contexts();
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+        AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
+        if (!codec_ctx) {
+            if (error_out) *error_out = "Failed to alloc codec context";
+            free_probe_contexts();
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+        if (avcodec_parameters_to_context(codec_ctx, fmt_ctx->streams[i]->codecpar) < 0 ||
+            avcodec_open2(codec_ctx, codec, nullptr) < 0) {
+            if (error_out) *error_out = "Failed to open codec";
+            avcodec_free_context(&codec_ctx);
+            free_probe_contexts();
+            avformat_close_input(&fmt_ctx);
+            return false;
+        }
+        probes.push_back({static_cast<int>(i), fmt_ctx->streams[i], codec_ctx});
     }
-    if (target_stream < 0) {
-        if (error_out) *error_out = "Video stream ordinal not found";
+
+    if (probes.empty()) {
+        if (error_out) *error_out = "No video stream found";
+        free_probe_contexts();
         avformat_close_input(&fmt_ctx);
         return false;
     }
 
-    AVStream* vstream = fmt_ctx->streams[target_stream];
-    const AVCodec* codec = avcodec_find_decoder(vstream->codecpar->codec_id);
-    if (!codec) {
-        if (error_out) *error_out = "Decoder not found";
-        avformat_close_input(&fmt_ctx);
-        return false;
-    }
-    AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
-    if (!codec_ctx) {
-        if (error_out) *error_out = "Failed to alloc codec context";
-        avformat_close_input(&fmt_ctx);
-        return false;
-    }
-    avcodec_parameters_to_context(codec_ctx, vstream->codecpar);
-    if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
-        if (error_out) *error_out = "Failed to open codec";
-        avcodec_free_context(&codec_ctx);
-        avformat_close_input(&fmt_ctx);
-        return false;
+    std::vector<ProbeDecoder*> lookup(fmt_ctx->nb_streams, nullptr);
+    for (auto& probe : probes) {
+        lookup[probe.stream_index] = &probe;
     }
 
-    SwsContext* sws_ctx = nullptr;
     AVFrame* frame = av_frame_alloc();
     AVPacket* pkt = av_packet_alloc();
+    if (!frame || !pkt) {
+        if (error_out) *error_out = "Failed to allocate ffmpeg buffers";
+        if (frame) {
+            av_frame_free(&frame);
+        }
+        if (pkt) {
+            av_packet_free(&pkt);
+        }
+        free_probe_contexts();
+        avformat_close_input(&fmt_ctx);
+        return false;
+    }
+    bool saw_frame = false;
+    double local_min = std::numeric_limits<double>::infinity();
+    double local_max = -std::numeric_limits<double>::infinity();
 
-    while (av_read_frame(fmt_ctx, pkt) >= 0) {
-        if (pkt->stream_index != target_stream) {
+    auto drain_probe = [&](ProbeDecoder& probe_ctx) -> bool {
+        while (true) {
+            int rr = avcodec_receive_frame(probe_ctx.codec_ctx, frame);
+            if (rr == AVERROR(EAGAIN) || rr == AVERROR_EOF) {
+                break;
+            }
+            if (rr < 0) {
+                if (error_out) *error_out = "Failed to receive frame";
+                return false;
+            }
+            double t = FrameTimestampSec(frame, probe_ctx.stream);
+            if (std::isfinite(t)) {
+                if (!saw_frame) {
+                    local_min = t;
+                    local_max = t;
+                    saw_frame = true;
+                } else {
+                    local_min = std::min(local_min, t);
+                    local_max = std::max(local_max, t);
+                }
+            }
+            av_frame_unref(frame);
+        }
+        return true;
+    };
+
+    bool ok = true;
+    while (ok && av_read_frame(fmt_ctx, pkt) >= 0) {
+        ProbeDecoder* target = lookup[pkt->stream_index];
+        if (!target) {
             av_packet_unref(pkt);
             continue;
         }
-
-        if (avcodec_send_packet(codec_ctx, pkt) < 0) {
+        if (avcodec_send_packet(target->codec_ctx, pkt) < 0) {
             av_packet_unref(pkt);
             continue;
         }
         av_packet_unref(pkt);
-
-        while (true) {
-            int rr = avcodec_receive_frame(codec_ctx, frame);
-            if (rr == AVERROR(EAGAIN) || rr == AVERROR_EOF) break;
-            if (rr < 0) break;
-
-            double tb = av_q2d(vstream->time_base);
-            int64_t pts = (frame->best_effort_timestamp == AV_NOPTS_VALUE) ? frame->pts : frame->best_effort_timestamp;
-            double t_video = (pts == AV_NOPTS_VALUE) ? 0.0 : pts * tb;
-
-            if (!sws_ctx) {
-                sws_ctx = sws_getContext(
-                    frame->width, frame->height, (AVPixelFormat)frame->format,
-                    frame->width, frame->height, AV_PIX_FMT_BGR24,
-                    SWS_BILINEAR, nullptr, nullptr, nullptr);
-                if (!sws_ctx) {
-                    av_frame_unref(frame);
-                    continue;
-                }
-            }
-
-            cv::Mat bgr(frame->height, frame->width, CV_8UC3);
-            uint8_t* dst_data[4] = { bgr.data, nullptr, nullptr, nullptr };
-            int dst_linesize[4] = { static_cast<int>(bgr.step[0]), 0, 0, 0 };
-            sws_scale(sws_ctx,
-                      (const uint8_t* const*)frame->data, frame->linesize,
-                      0, frame->height,
-                      dst_data, dst_linesize);
-
-            RawFrame rf;
-            rf.t_video = t_video;
-            rf.image = bgr.clone();
-            out_frames.push_back(std::move(rf));
-
-            av_frame_unref(frame);
-        }
+        ok = drain_probe(*target);
     }
 
-    if (sws_ctx) sws_freeContext(sws_ctx);
-    av_frame_free(&frame);
+    for (auto& probe_ctx : probes) {
+        if (!ok) {
+            break;
+        }
+        avcodec_send_packet(probe_ctx.codec_ctx, nullptr);
+        ok = drain_probe(probe_ctx);
+    }
+
+    if (ok && !saw_frame) {
+        ok = false;
+        if (error_out) *error_out = "No video frames decoded";
+    }
+
+    if (ok) {
+        min_sec = local_min;
+        max_sec = local_max;
+    }
+
     av_packet_free(&pkt);
-    avcodec_free_context(&codec_ctx);
+    av_frame_free(&frame);
+    free_probe_contexts();
     avformat_close_input(&fmt_ctx);
-    return true;
+
+    return ok;
 }
 
-bool InsvVideoDecoder::decode_all(std::vector<DecodedFrame>& out_frames, std::string* error_out) {
-    out_frames.clear();
+bool InsvVideoDecoder::stream_decode(const std::function<bool(DecodedFrame&&)>& on_frame,
+                                     std::string* error_out) {
+    if (!on_frame) {
+        if (error_out) *error_out = "Frame callback missing";
+        return false;
+    }
 
     AVFormatContext* fmt_ctx = nullptr;
-    int ret = avformat_open_input(&fmt_ctx, path_.c_str(), nullptr, nullptr);
-    if (ret < 0) {
+    if (avformat_open_input(&fmt_ctx, path_.c_str(), nullptr, nullptr) < 0) {
         if (error_out) *error_out = "Failed to open input";
         return false;
     }
-    ret = avformat_find_stream_info(fmt_ctx, nullptr);
-    if (ret < 0) {
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
         if (error_out) *error_out = "Failed to find stream info";
         avformat_close_input(&fmt_ctx);
         return false;
     }
 
-    int video_stream_count = 0;
+    struct StreamState {
+        int stream_index{-1};
+        AVStream* stream{nullptr};
+        AVCodecContext* codec_ctx{nullptr};
+        SwsContext* sws_ctx{nullptr};
+        std::deque<RawFrame> ready_frames;
+    };
+
+    std::vector<int> video_indices;
     for (unsigned int i = 0; i < fmt_ctx->nb_streams; ++i) {
         if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            ++video_stream_count;
+            video_indices.push_back(static_cast<int>(i));
+        }
+    }
+    if (video_indices.empty()) {
+        if (error_out) *error_out = "No video stream found";
+        avformat_close_input(&fmt_ctx);
+        return false;
+    }
+
+    const size_t stream_count = std::min<size_t>(2, video_indices.size());
+    std::vector<StreamState> streams;
+    streams.reserve(stream_count);
+    bool ok = true;
+    for (size_t ordinal = 0; ordinal < stream_count; ++ordinal) {
+        int idx = video_indices[ordinal];
+        AVStream* av_stream = fmt_ctx->streams[idx];
+        const AVCodec* codec = avcodec_find_decoder(av_stream->codecpar->codec_id);
+        if (!codec) {
+            if (error_out) *error_out = "Decoder not found";
+            ok = false;
+            break;
+        }
+        AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
+        if (!codec_ctx) {
+            if (error_out) *error_out = "Failed to alloc codec context";
+            ok = false;
+            break;
+        }
+        if (avcodec_parameters_to_context(codec_ctx, av_stream->codecpar) < 0 ||
+            avcodec_open2(codec_ctx, codec, nullptr) < 0) {
+            if (error_out) *error_out = "Failed to open codec";
+            avcodec_free_context(&codec_ctx);
+            ok = false;
+            break;
+        }
+        StreamState state;
+        state.stream_index = idx;
+        state.stream = av_stream;
+        state.codec_ctx = codec_ctx;
+        streams.push_back(std::move(state));
+    }
+
+    if (!ok || streams.empty()) {
+        for (auto& state : streams) {
+            if (state.sws_ctx) {
+                sws_freeContext(state.sws_ctx);
+            }
+            if (state.codec_ctx) {
+                avcodec_free_context(&state.codec_ctx);
+            }
+        }
+        avformat_close_input(&fmt_ctx);
+        return false;
+    }
+
+    std::vector<StreamState*> lookup(fmt_ctx->nb_streams, nullptr);
+    for (auto& state : streams) {
+        lookup[state.stream_index] = &state;
+    }
+
+    AVFrame* frame = av_frame_alloc();
+    AVPacket* pkt = av_packet_alloc();
+    bool stop_requested = false;
+
+    auto convert_frame = [&](StreamState& state) -> bool {
+        while (true) {
+            int rr = avcodec_receive_frame(state.codec_ctx, frame);
+            if (rr == AVERROR(EAGAIN) || rr == AVERROR_EOF) {
+                break;
+            }
+            if (rr < 0) {
+                if (error_out) *error_out = "Failed to receive frame";
+                return false;
+            }
+
+            state.sws_ctx = sws_getCachedContext(
+                state.sws_ctx,
+                frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
+                frame->width, frame->height, AV_PIX_FMT_BGR24,
+                SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (!state.sws_ctx) {
+                if (error_out) *error_out = "Failed to init scaler";
+                return false;
+            }
+
+            cv::Mat bgr(frame->height, frame->width, CV_8UC3);
+            uint8_t* dst_data[4] = { bgr.data, nullptr, nullptr, nullptr };
+            int dst_linesize[4] = { static_cast<int>(bgr.step[0]), 0, 0, 0 };
+            sws_scale(state.sws_ctx,
+                      (const uint8_t* const*)frame->data, frame->linesize,
+                      0, frame->height,
+                      dst_data, dst_linesize);
+
+            RawFrame rf;
+            rf.t_video = FrameTimestampSec(frame, state.stream);
+            rf.image = std::move(bgr);
+            state.ready_frames.push_back(std::move(rf));
+            av_frame_unref(frame);
+        }
+        return true;
+    };
+
+    auto emit_frames = [&]() -> bool {
+        if (streams.empty()) {
+            return true;
+        }
+        if (streams.size() == 1) {
+            auto& queue = streams[0].ready_frames;
+            while (!queue.empty()) {
+                RawFrame raw = std::move(queue.front());
+                queue.pop_front();
+                DecodedFrame df;
+                int half_w = raw.image.cols / 2;
+                int other_w = raw.image.cols - half_w;
+                if (half_w <= 0 || other_w <= 0) {
+                    continue;
+                }
+                df.rear = raw.image(cv::Rect(0, 0, half_w, raw.image.rows)).clone();
+                df.front = raw.image(cv::Rect(half_w, 0, other_w, raw.image.rows)).clone();
+                df.t_video = raw.t_video;
+                if (!on_frame(std::move(df))) {
+                    return false;
+                }
+            }
+        } else {
+            auto& front_q = streams[0].ready_frames;
+            auto& rear_q = streams[1].ready_frames;
+            while (!front_q.empty() && !rear_q.empty()) {
+                RawFrame front = std::move(front_q.front());
+                RawFrame rear = std::move(rear_q.front());
+                front_q.pop_front();
+                rear_q.pop_front();
+                DecodedFrame df;
+                df.front = std::move(front.image);
+                df.rear = std::move(rear.image);
+                df.t_video = std::min(front.t_video, rear.t_video);
+                if (!on_frame(std::move(df))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    while (ok && !stop_requested && av_read_frame(fmt_ctx, pkt) >= 0) {
+        StreamState* target = lookup[pkt->stream_index];
+        if (!target) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        if (avcodec_send_packet(target->codec_ctx, pkt) < 0) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        av_packet_unref(pkt);
+        ok = convert_frame(*target);
+        if (ok) {
+            stop_requested = !emit_frames();
+        }
+    }
+
+    for (auto& state : streams) {
+        if (!ok || stop_requested) {
+            break;
+        }
+        avcodec_send_packet(state.codec_ctx, nullptr);
+        ok = convert_frame(state);
+        if (ok) {
+            stop_requested = !emit_frames();
+        }
+    }
+
+    if (!ok && error_out && error_out->empty()) {
+        *error_out = "Video decode failed";
+    }
+
+    if (!stop_requested && ok) {
+        stop_requested = !emit_frames();
+    }
+
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+    for (auto& state : streams) {
+        if (state.sws_ctx) {
+            sws_freeContext(state.sws_ctx);
+        }
+        if (state.codec_ctx) {
+            avcodec_free_context(&state.codec_ctx);
         }
     }
     avformat_close_input(&fmt_ctx);
 
-    if (video_stream_count == 0) {
-        if (error_out) *error_out = "No video stream found";
-        return false;
-    }
-
-    std::vector<RawFrame> stream_a;
-    std::vector<RawFrame> stream_b;
-
-    if (!DecodeStreamOrdinal(path_, 0, stream_a, error_out)) {
-        return false;
-    }
-
-    // If there is only one video stream, split the side-by-side frame into rear/front halves. 
-    // TODO: remove this split logic for single stream INSV files.
-    if (video_stream_count == 1) {
-        for (const auto& rf : stream_a) {
-            DecodedFrame df;
-            int half_w = rf.image.cols / 2;
-            df.rear = rf.image(cv::Rect(0, 0, half_w, rf.image.rows)).clone();
-            df.front = rf.image(cv::Rect(half_w, 0, half_w, rf.image.rows)).clone();
-            df.t_video = rf.t_video;
-            out_frames.push_back(std::move(df));
-        }
-    } else {
-        if (!DecodeStreamOrdinal(path_, 1, stream_b, error_out)) {
-            return false;
-        }
-        size_t paired = std::min(stream_a.size(), stream_b.size());
-        for (size_t i = 0; i < paired; ++i) {
-            DecodedFrame df;
-            df.front = stream_a[i].image;
-            df.rear = stream_b[i].image;
-            df.t_video = std::min(stream_a[i].t_video, stream_b[i].t_video);
-            out_frames.push_back(std::move(df));
-        }
-    }
-
-    return true;
+    return ok || stop_requested;
 }
 
 } // namespace insta360_insv

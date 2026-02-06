@@ -114,7 +114,7 @@ public:
             RCLCPP_WARN(get_logger(), "No video timestamps (0x600) found; alignment will use zero offset");
         }
 
-        // Decode frames first to derive reliable video time window from frame PTS
+        // Probe video timestamps first to derive a reliable window without buffering frames
         {
             insta360_insv::InsvVideoDecoder decoder(file_path_);
             std::string derr;
@@ -123,19 +123,20 @@ public:
                 return;
             }
 
-            if (!decoder.decode_all(frames_, &derr)) {
-                RCLCPP_ERROR(get_logger(), "Decode failed: %s", derr.c_str());
+            double vmin = 0.0;
+            double vmax = 0.0;
+            if (!decoder.probe_time_window(vmin, vmax, &derr)) {
+                RCLCPP_ERROR(get_logger(), "Failed to probe video timestamps: %s", derr.c_str());
                 return;
             }
 
-            if (frames_.empty()) {
-                RCLCPP_ERROR(get_logger(), "No video frames decoded; cannot determine video duration");
+            if (!std::isfinite(vmin) || !std::isfinite(vmax)) {
+                RCLCPP_ERROR(get_logger(), "Video timestamps are not finite (min=%.3f max=%.3f)", vmin, vmax);
                 return;
             }
 
-            // Use decoded frame timestamps as ground truth window
-            video_min_sec_ = frames_.front().t_video;
-            video_max_sec_ = frames_.back().t_video;
+            video_min_sec_ = vmin;
+            video_max_sec_ = vmax;
             video_dur_sec_ = std::max(0.0, video_max_sec_ - video_min_sec_);
         }
 
@@ -393,20 +394,22 @@ private:
     }
 
     void DecodeAndWriteVideo() {
-        if (frames_.empty()) {
-            RCLCPP_ERROR(get_logger(), "No decoded frames available to write");
+        insta360_insv::InsvVideoDecoder decoder(file_path_);
+        std::string derr;
+        if (!decoder.open(&derr)) {
+            RCLCPP_ERROR(get_logger(), "Decoder open failed: %s", derr.c_str());
             return;
         }
 
         double offset_sec = 0.0;
-        if (!frames_.empty() && !video_ts_raw_.empty()) {
+        if (!video_ts_raw_.empty() && std::isfinite(video_min_sec_)) {
             const double vmin = video_ts_raw_.front();
             const double vmax = video_ts_raw_.back();
             const double vspan = std::max(0.0, vmax - vmin);
             const double vscale = (vspan > 1e6 ? 1e-6 : 1e-3);
             const double base_ts = vmin * vscale;
-            offset_sec = frames_.front().t_video - base_ts;
-            RCLCPP_INFO(get_logger(), "Computed offset_sec=%.6f (t_video=%.6f, trailer_ts=%.6f)", offset_sec, frames_.front().t_video, base_ts);
+            offset_sec = video_min_sec_ - base_ts;
+            RCLCPP_INFO(get_logger(), "Computed offset_sec=%.6f (video_start=%.6f, trailer_ts=%.6f)", offset_sec, video_min_sec_, base_ts);
         }
 
         const std::string rear_topic_to_write = compressed_images_ ? rear_topic_ + "/compressed" : rear_topic_;
@@ -414,97 +417,78 @@ private:
 
         rclcpp::Serialization<sensor_msgs::msg::Image> img_serializer;
         rclcpp::Serialization<sensor_msgs::msg::CompressedImage> compressed_serializer;
-        int64_t frame_idx = 0;
+        size_t frame_idx = 0;
         size_t skipped_frames = 0;
-        for (const auto& f : frames_) {
-            const double stamp_sec = f.t_video - offset_sec;
+
+        auto write_one = [&](const cv::Mat& image,
+                             const std::string& frame_id,
+                             const std::string& topic,
+                             const rclcpp::Time& stamp) {
+            if (compressed_images_) {
+                sensor_msgs::msg::CompressedImage msg;
+                msg.header.stamp = stamp;
+                msg.header.frame_id = frame_id;
+                std::string fmt = image_transport_format_;
+                std::vector<int> params;
+                if (fmt == "jpeg" || fmt == "jpg") {
+                    params = { cv::IMWRITE_JPEG_QUALITY, jpeg_quality_ };
+                    fmt = "jpeg";
+                } else if (fmt == "png") {
+                    params = { cv::IMWRITE_PNG_COMPRESSION, 3 };
+                    fmt = "png";
+                }
+                cv::imencode("." + fmt, image, msg.data, params);
+                msg.format = fmt;
+                rclcpp::SerializedMessage serialized;
+                compressed_serializer.serialize_message(&msg, &serialized);
+                std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
+                    std::make_shared<rclcpp::SerializedMessage>(serialized);
+                writer_.write(serialized_ptr, topic, "sensor_msgs/msg/CompressedImage", stamp);
+            } else {
+                std_msgs::msg::Header header;
+                header.stamp = stamp;
+                header.frame_id = frame_id;
+                cv_bridge::CvImage cv_img(header, sensor_msgs::image_encodings::BGR8, image);
+                sensor_msgs::msg::Image msg;
+                cv_img.toImageMsg(msg);
+                rclcpp::SerializedMessage serialized;
+                img_serializer.serialize_message(&msg, &serialized);
+                std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
+                    std::make_shared<rclcpp::SerializedMessage>(serialized);
+                writer_.write(serialized_ptr, topic, "sensor_msgs/msg/Image", stamp);
+            }
+        };
+
+        auto write_frame = [&](insta360_insv::DecodedFrame&& frame) {
+            const double stamp_sec = frame.t_video - offset_sec;
             if (!std::isfinite(stamp_sec)) {
-                skipped_frames++;
-                continue;
+                ++skipped_frames;
+                return true;
             }
             const int64_t stamp_ns = static_cast<int64_t>(stamp_sec * 1e9);
             if (stamp_ns < 0) {
-                skipped_frames++;
-                continue;
+                ++skipped_frames;
+                return true;
             }
             rclcpp::Time stamp(stamp_ns);
+            write_one(frame.rear, frame_id_rear_, rear_topic_to_write, stamp);
+            write_one(frame.front, frame_id_front_, front_topic_to_write, stamp);
+            ++frame_idx;
+            return true;
+        };
 
-            // rear
-            {
-                if (compressed_images_) {
-                    sensor_msgs::msg::CompressedImage msg;
-                    msg.header.stamp = stamp;
-                    msg.header.frame_id = frame_id_rear_;
-                    msg.format = image_transport_format_;
-                    std::vector<int> params;
-                    if (image_transport_format_ == "jpeg" || image_transport_format_ == "jpg") {
-                        params = { cv::IMWRITE_JPEG_QUALITY, jpeg_quality_ };
-                        msg.format = "jpeg";
-                    } else if (image_transport_format_ == "png") {
-                        params = { cv::IMWRITE_PNG_COMPRESSION, 3 };
-                        msg.format = "png";
-                    }
-                    cv::imencode("." + msg.format, f.rear, msg.data, params);
-                    rclcpp::SerializedMessage serialized;
-                    compressed_serializer.serialize_message(&msg, &serialized);
-                    std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
-                        std::make_shared<rclcpp::SerializedMessage>(serialized);
-                    writer_.write(serialized_ptr, rear_topic_to_write, "sensor_msgs/msg/CompressedImage", stamp);
-                } else {
-                    std_msgs::msg::Header header;
-                    header.stamp = stamp;
-                    header.frame_id = frame_id_rear_;
-                    cv_bridge::CvImage cv_img(header, sensor_msgs::image_encodings::BGR8, f.rear);
-                    sensor_msgs::msg::Image msg;
-                    cv_img.toImageMsg(msg);
-                    rclcpp::SerializedMessage serialized;
-                    img_serializer.serialize_message(&msg, &serialized);
-                    std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
-                        std::make_shared<rclcpp::SerializedMessage>(serialized);
-                    writer_.write(serialized_ptr, rear_topic_to_write, "sensor_msgs/msg/Image", stamp);
-                }
-            }
-            // front
-            {
-                if (compressed_images_) {
-                    sensor_msgs::msg::CompressedImage msg;
-                    msg.header.stamp = stamp;
-                    msg.header.frame_id = frame_id_front_;
-                    msg.format = image_transport_format_;
-                    std::vector<int> params;
-                    if (image_transport_format_ == "jpeg" || image_transport_format_ == "jpg") {
-                        params = { cv::IMWRITE_JPEG_QUALITY, jpeg_quality_ };
-                        msg.format = "jpeg";
-                    } else if (image_transport_format_ == "png") {
-                        params = { cv::IMWRITE_PNG_COMPRESSION, 3 };
-                        msg.format = "png";
-                    }
-                    cv::imencode("." + msg.format, f.front, msg.data, params);
-                    rclcpp::SerializedMessage serialized;
-                    compressed_serializer.serialize_message(&msg, &serialized);
-                    std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
-                        std::make_shared<rclcpp::SerializedMessage>(serialized);
-                    writer_.write(serialized_ptr, front_topic_to_write, "sensor_msgs/msg/CompressedImage", stamp);
-                } else {
-                    std_msgs::msg::Header header;
-                    header.stamp = stamp;
-                    header.frame_id = frame_id_front_;
-                    cv_bridge::CvImage cv_img(header, sensor_msgs::image_encodings::BGR8, f.front);
-                    sensor_msgs::msg::Image msg;
-                    cv_img.toImageMsg(msg);
-                    rclcpp::SerializedMessage serialized;
-                    img_serializer.serialize_message(&msg, &serialized);
-                    std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
-                        std::make_shared<rclcpp::SerializedMessage>(serialized);
-                    writer_.write(serialized_ptr, front_topic_to_write, "sensor_msgs/msg/Image", stamp);
-                }
-            }
-            frame_idx++;
+        if (!decoder.stream_decode(write_frame, &derr)) {
+            RCLCPP_ERROR(get_logger(), "Decode failed: %s", derr.c_str());
+            return;
+        }
+
+        if (frame_idx == 0) {
+            RCLCPP_WARN(get_logger(), "Stream decode produced zero frames");
         }
         if (skipped_frames > 0) {
             RCLCPP_WARN(get_logger(), "Skipped %zu frames with invalid timestamps", skipped_frames);
         }
-        RCLCPP_INFO(get_logger(), "Wrote %ld video frames (front+rear)", (long)frame_idx);
+        RCLCPP_INFO(get_logger(), "Wrote %zu video frames (front+rear)", frame_idx);
     }
 
     // Params
@@ -533,8 +517,6 @@ private:
     double video_dur_sec_{std::numeric_limits<double>::quiet_NaN()};
     double time_window_margin_sec_{0.05};
     int jpeg_quality_{90};
-
-    std::vector<insta360_insv::DecodedFrame> frames_;
 
     rosbag2_cpp::Writer writer_;
 };
