@@ -1,6 +1,13 @@
 # insta360_ros_driver
 
-A ROS driver for the Insta360 cameras. This driver is tested on Ubuntu 22.04 with ROS2 Humble. The driver has also been verified on the Insta360 X2 and X3 cameras. The following resolutions are available, all at 30 FPS.
+
+
+A ROS driver for the Insta360 cameras. This driver is tested on ROS2 Jazzy and has 2 main features:
+
+- `INSV2BAG Converter`: A ROS2 node decoding Insta360 dual-fisheye video files (INSV format), extracting embedded IMU data and dual fisheye frames and saving into ros2 bag files. 
+- `Livestream Extractor`: A ROS2 node decoding Insta360 livestream and publishing IMU data and dual fisheye frames.
+
+The driver has also been verified on the Insta360 X2, X3 and X5 cameras. The following resolutions are available, all at 30 FPS.
 - 3840 x 1920
 - 2560 x 1280
 - 2304 x 1152
@@ -9,25 +16,25 @@ A ROS driver for the Insta360 cameras. This driver is tested on Ubuntu 22.04 wit
 You can change [this line](https://github.com/ai4ce/insta360_ros_driver/blob/79588d9e0e9d029c3371d4095ea718daaf1e06fb/src/main.cpp#L126) to edit the resolution.
 
 ## Installation
-To use this driver, you need to first have Insta360 SDK. Please apply for the SDK from the [Insta360 website](https://www.insta360.com/sdk/home). 
+```
+cd ~/colcon_ws/src
+git clone https://github.com/Alexander-guo/insta360_ros2.git
+cd ..
+```
+An Insta360 SDK is needed to use `Livestream Extractor`. If you want to update it to the latest version of SDK, apply from the [Insta360 website](https://www.insta360.com/sdk/home). 
 
 For additional instructions, see this [post](https://github.com/ai4ce/insta360_ros_driver/issues/10#issuecomment-3371481987).
 
-**Note: Please make you use the latest SDK. This package works with the SDK posted after April 23, 2025**
+Then, the latest Insta360 libraries need to be installed as follows:
+- Replace the <code>camera</code> and <code>stream</code> header files inside the <code>include</code> directory with new files.
+- Replace the <code>libCameraSDK.so</code> library under the <code>lib</code> directory with new files.
 
-```
-cd ~/ros2_ws/src
-git clone -b humble https://github.com/ai4ce/insta360_ros_driver
-cd ..
-```
-Then, the Insta360 libraries need to be installed as follows:
-- add the <code>camera</code> and <code>stream</code> header files inside the <code>include</code> directory
-- add the <code>libCameraSDK.so</code> library under the <code>lib</code> directory.
+**Note: This package works with the SDK posted after April 23, 2025 and a proper version of SDK is already included in this repo.**
 
 Afterwards, install the other required dependencies and build
 ```
 rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install
+colcon build --symlink-install --event-handlers console_direct+
 source install/setup.bash
 ```
 
@@ -60,9 +67,23 @@ sudo chmod 777 /dev/insta
 ```
 
 ## Usage
-The camera provides images natively in H264 compressed image format. We have a decoder node that 
 
-### Camera Bringup
+### `INSV2BAG Converter`
+```
+ros2 launch insta360_ros_driver insv_dual_fisheye_bag.launch.py file_path:=<path_to_INSV_file> bag_path:=<path_to_output_bag>
+```
+Check parameters in [insv_dual_fisheye_bag_node.cpp](src/insv_dual_fisheye_bag_node.cpp)  and modify accordingly in [insv_dual_fisheye_bag.launch.py](launch/insv_dual_fisheye_bag.launch.py).
+
+#### Saved Topics:
+- /insta360/front/image_raw(/compressed)
+- /insta360/rear/image_raw(/compressed)
+- /insta360/imu
+
+IMU topic frequency is ~1000Hz tested with INSV files recorded by Insta360 X5.
+
+### `Livestream Etractor` Camera Bringup
+The camera provides images natively in H264 compressed image format.
+
 The camera can be brought up with the following launch file
 ```
 ros2 launch insta360_ros_driver bringup.launch.xml
@@ -129,6 +150,11 @@ Note that decode.py will most likely drop frames depending on your system. If yo
 ros2 bag record /dual_fisheye/image /imu/data_raw
 ```
 
-## Star History
+<!-- ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=ai4ce/insta360_ros_driver&type=Date)](https://star-history.com/#ai4ce/insta360_ros_driver&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=ai4ce/insta360_ros_driver&type=Date)](https://star-history.com/#ai4ce/insta360_ros_driver&Date) -->
+
+
+## TODO
+- `INSV2BAG Converter`:
+  - Enable Multi-threading to accelerate conversion.
