@@ -74,6 +74,23 @@ ros2 launch insta360_ros_driver insv_dual_fisheye_bag.launch.py file_path:=<path
 ```
 Check parameters in [insv_dual_fisheye_bag_node.cpp](src/insv_dual_fisheye_bag_node.cpp)  and modify accordingly in [insv_dual_fisheye_bag.launch.py](launch/insv_dual_fisheye_bag.launch.py).
 
+#### Launch Arguments
+The [launch file](launch/insv_dual_fisheye_bag.launch.py) exposes the following arguments so you can tailor the conversion pipeline:
+- `file_path` (required) – Absolute path to the source `.insv` file that should be decoded.
+- `bag_path` (required) – Destination directory for the output rosbag2 recording; created if it does not exist.
+- `front_topic` (default `/insta360/front/image_raw`) – ROS topic receiving the front fisheye frames.
+- `rear_topic` (default `/insta360/rear/image_raw`) – ROS topic receiving the rear fisheye frames.
+- `imu_topic` (default `/insta360/imu`) – Topic that stores IMU messages extracted from the INSV file.
+- `frame_id_front` (default `front_frame`) – `header.frame_id` assigned to the front camera images.
+- `frame_id_rear` (default `rear_frame`) – `header.frame_id` assigned to the rear camera images.
+- `imu_frame_id` (default `imu_frame`) – Frame identifier applied to IMU data.
+- `compressed_images` (default `true`) – When true, the node only writes `sensor_msgs/CompressedImage` under `<topic>/compressed` instead of raw images.
+- `image_transport_format` (default `jpeg`) – Encoding format for compressed images; switch to `png` for lossless storage.
+- `storage_id` (default `db3`) – rosbag2 storage backend (`db3` for SQLite, `mcap` for MCAP).
+- `jpeg_quality` (default `50`) – Quality level (1–100) for JPEG encoding; ignored when `image_transport_format` is `png`.
+- `encoding_threads` (default `0`) – Number of worker threads used for image compression (`0` use all the cpu cores).
+- `decoder_threads` (default `0`) – Number of FFmpeg threads dedicated to video decoding (`0` use all the cpu cores).
+
 #### Saved Topics:
 - /insta360/front/image_raw(/compressed)
 - /insta360/rear/image_raw(/compressed)
