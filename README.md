@@ -170,8 +170,3 @@ ros2 bag record /dual_fisheye/image /imu/data_raw
 <!-- ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=ai4ce/insta360_ros_driver&type=Date)](https://star-history.com/#ai4ce/insta360_ros_driver&Date) -->
-
-
-## TODO
-- `INSV2BAG Converter`:
-  - Enable Multi-threading to accelerate conversion.
