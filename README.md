@@ -2,10 +2,10 @@
 
 
 
-A ROS driver for the Insta360 cameras. This driver is tested on ROS2 Jazzy and has 2 main features:
+A ROS2 package for the Insta360 cameras. This package is tested on ROS2 Jazzy and has 2 main features:
 
-- `INSV2BAG Converter`: A ROS2 node decoding Insta360 dual-fisheye video files (INSV format), extracting embedded IMU data and dual fisheye frames and saving into ros2 bag files. 
-- `Livestream Extractor`: A ROS2 node decoding Insta360 livestream and publishing IMU data and dual fisheye frames.
+- `INSV2BAG Converter`: A ROS2 node decoding Insta360 dual-fisheye video files (INSV format, tested on **Insta360 X5 only**), extracting embedded IMU data and dual fisheye frames and saving into ros2 bag files. 
+- `Livestream Extractor`: A ROS2 driver decoding Insta360 livestream and publishing IMU data along with dual fisheye frames.
 
 The driver has also been verified on the Insta360 X2, X3 and X5 cameras. The following resolutions are available, all at 30 FPS.
 - 3840 x 1920
@@ -96,9 +96,9 @@ The [launch file](launch/insv_dual_fisheye_bag.launch.py) exposes the following 
 - /insta360/rear/image_raw(/compressed)
 - /insta360/imu
 
-IMU topic frequency is ~1000Hz tested with INSV files recorded by Insta360 X5.
+IMU topic frequency is around **1000Hz** tested with INSV files recorded by Insta360 X5.
 
-### `Livestream Etractor` Camera Bringup
+### `Livestream Extractor` Camera Bringup
 The camera provides images natively in H264 compressed image format.
 
 The camera can be brought up with the following launch file

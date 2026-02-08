@@ -285,44 +285,24 @@ bool TrailerParser::ScanTailForRecords(const std::string& path, std::streamoff f
 }
 
 void TrailerParser::ParseImuRecord(uint16_t /*id*/, const uint8_t* data, size_t len, std::vector<ImuSample>& out_samples) const {
-    // Determine record stride: 56-byte (double precision) or 20-byte (scaled shorts).
-    size_t stride = 0;
-    if (len % 56 == 0) {
-        stride = 56;
-    } else if (len % 20 == 0) {
-        stride = 20;
-    } else if (len >= 56 && (len - 56) % 20 == 0) {
-        // Mixed types are unlikely; prefer double block if present.
-        stride = 56;
-    } else if (len >= 20) {
-        stride = 20;
-    }
+    constexpr size_t kShortStride = 20;
+    constexpr size_t kDoubleStride = 56;
+    constexpr bool kAllowHighPrecisionStride = false;  // X5 trailers are short stride only
 
-    if (stride == 0) {
+    if (len < kShortStride) {
         return;
     }
 
-    for (size_t offset = 0; offset + stride <= len; offset += stride) {
-        const uint8_t* rec = data + offset;
-        const uint64_t raw_time = ReadU64LE(rec);
-        if (raw_time == 0 || raw_time == std::numeric_limits<uint64_t>::max()) {
-            // Skip padding/marker entries commonly present in trailers
-            continue;
-        }
-        ImuSample sample;
-        sample.raw_time = static_cast<double>(raw_time);
-        sample.time_sec = std::numeric_limits<double>::quiet_NaN();
-
-        if (stride == 56) {
+    const auto decode_record = [&](const uint8_t* rec, size_t stride, ImuSample& sample) -> bool {
+        sample.high_precision = (stride == kDoubleStride);
+        if (sample.high_precision) {
             sample.ax = ReadF64LE(rec + 8);
             sample.ay = ReadF64LE(rec + 16);
             sample.az = ReadF64LE(rec + 24);
             sample.gx = ReadF64LE(rec + 32);
             sample.gy = ReadF64LE(rec + 40);
             sample.gz = ReadF64LE(rec + 48);
-            sample.high_precision = true;
         } else {
-            // 6x uint16_t, stored after 8-byte timestamp.
             uint16_t raw[6];
             std::memcpy(raw, rec + 8, sizeof(raw));
             const double scale = 1.0 / 1000.0;
@@ -335,10 +315,8 @@ void TrailerParser::ParseImuRecord(uint16_t /*id*/, const uint8_t* data, size_t 
             sample.gx = convert(raw[3]);
             sample.gy = convert(raw[4]);
             sample.gz = convert(raw[5]);
-            sample.high_precision = false;
         }
 
-        // Optional physical plausibility filter to suppress junk
         const double abs_ax = std::fabs(sample.ax);
         const double abs_ay = std::fabs(sample.ay);
         const double abs_az = std::fabs(sample.az);
@@ -347,7 +325,225 @@ void TrailerParser::ParseImuRecord(uint16_t /*id*/, const uint8_t* data, size_t 
         const double abs_gz = std::fabs(sample.gz);
         const bool accel_ok = (abs_ax < 16.0 && abs_ay < 16.0 && abs_az < 16.0);
         const bool gyro_ok = (abs_gx < 2000.0 && abs_gy < 2000.0 && abs_gz < 2000.0);
-        if (!(accel_ok && gyro_ok)) {
+        return accel_ok && gyro_ok;
+    };
+
+    struct ProbeResult {
+        size_t stride{0};
+        size_t offset{0};
+        size_t inspected_records{0};
+        size_t accepted_records{0};
+        size_t monotonic_errors{0};
+        size_t jump_outliers{0};
+        size_t invalid_ts{0};
+        size_t invalid_values{0};
+        double first_ts{std::numeric_limits<double>::quiet_NaN()};
+        double last_ts{std::numeric_limits<double>::quiet_NaN()};
+        double median_dt{std::numeric_limits<double>::quiet_NaN()};
+        double coverage{0.0};
+        double score{0.0};
+        bool dt_reasonable{false};
+        bool viable{false};
+    };
+
+    auto compute_median = [](std::vector<double>& values) -> double {
+        if (values.empty()) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        const size_t mid = values.size() / 2;
+        std::nth_element(values.begin(), values.begin() + mid, values.end());
+        double median = values[mid];
+        if ((values.size() % 2) == 0) {
+            std::nth_element(values.begin(), values.begin() + mid - 1, values.end());
+            median = 0.5 * (median + values[mid - 1]);
+        }
+        return median;
+    };
+
+    auto probe_stride = [&](size_t stride, size_t start_offset) {
+        ProbeResult result;
+        result.stride = stride;
+        result.offset = start_offset;
+        if (stride == 0 || start_offset >= len || len - start_offset < stride) {
+            return result;
+        }
+
+        const size_t available = len - start_offset;
+        const size_t max_records = available / stride;
+        if (max_records == 0) {
+            return result;
+        }
+
+        const size_t max_probe = std::min<size_t>(max_records, static_cast<size_t>(512));
+        const size_t max_inspected = std::min<size_t>(max_records, max_probe * 4);
+        if (max_probe == 0) {
+            return result;
+        }
+
+        std::vector<double> dt_samples;
+        dt_samples.reserve(max_probe);
+
+        double prev_ts = std::numeric_limits<double>::quiet_NaN();
+        for (size_t idx = 0; idx < max_inspected; ++idx) {
+            if (result.accepted_records >= max_probe) {
+                break;
+            }
+            const size_t offset = start_offset + idx * stride;
+            if (offset + stride > len) {
+                break;
+            }
+
+            ++result.inspected_records;
+            const uint8_t* rec = data + offset;
+            const uint64_t raw_time = ReadU64LE(rec);
+            if (raw_time == 0 || raw_time == std::numeric_limits<uint64_t>::max()) {
+                ++result.invalid_ts;
+                continue;
+            }
+
+            const double ts = static_cast<double>(raw_time);
+            if (!std::isfinite(ts)) {
+                ++result.invalid_ts;
+                continue;
+            }
+
+            ImuSample tmp;
+            if (!decode_record(rec, stride, tmp)) {
+                ++result.invalid_values;
+                continue;
+            }
+
+            if (!std::isfinite(result.first_ts)) {
+                result.first_ts = ts;
+            } else {
+                if (ts <= prev_ts) {
+                    ++result.monotonic_errors;
+                    continue;
+                }
+                const double dt = ts - prev_ts;
+                if (dt <= 0.0) {
+                    ++result.monotonic_errors;
+                    continue;
+                }
+                if (dt > 5.0e6) {
+                    ++result.jump_outliers;
+                    continue;
+                }
+                if (dt_samples.size() < max_probe) {
+                    dt_samples.push_back(dt);
+                }
+            }
+
+            prev_ts = ts;
+            result.last_ts = ts;
+            ++result.accepted_records;
+        }
+
+        if (result.accepted_records == 0 || result.inspected_records == 0) {
+            return result;
+        }
+
+        if (!dt_samples.empty()) {
+            result.median_dt = compute_median(dt_samples);
+            if (std::isfinite(result.median_dt)) {
+                result.dt_reasonable = (result.median_dt >= 5.0 && result.median_dt <= 5.0e5);
+            }
+        }
+
+        result.coverage = static_cast<double>(result.accepted_records) /
+                          static_cast<double>(result.inspected_records);
+
+        const double penalties = static_cast<double>(result.monotonic_errors) * 6.0 +
+                                 static_cast<double>(result.jump_outliers) * 8.0 +
+                                 static_cast<double>(result.invalid_ts + result.invalid_values) * 0.5;
+        double base = static_cast<double>(result.accepted_records);
+        if (result.accepted_records >= 64) {
+            base += std::log1p(static_cast<double>(result.accepted_records));
+        }
+        double quality = std::max(0.05, result.coverage);
+        if (!result.dt_reasonable) {
+            quality *= 0.1;
+        }
+        if (!std::isfinite(result.last_ts) || !std::isfinite(result.first_ts) ||
+            result.last_ts <= result.first_ts) {
+            quality *= 0.1;
+        }
+
+        result.score = std::max(0.0, base * quality - penalties);
+        result.viable = (result.accepted_records >= 12) && (result.coverage >= 0.2) &&
+                        (result.score > 0.0);
+        return result;
+    };
+
+    std::vector<ProbeResult> candidates;
+    candidates.reserve(32);
+
+    auto try_stride = [&](size_t stride) {
+        if (stride == 0) {
+            return;
+        }
+        const size_t max_offset = std::min(stride, len);
+        for (size_t start = 0; start < max_offset; ++start) {
+            auto result = probe_stride(stride, start);
+            if (result.inspected_records == 0) {
+                continue;
+            }
+            candidates.push_back(std::move(result));
+        }
+    };
+
+    try_stride(kShortStride);
+    if (kAllowHighPrecisionStride) {
+        try_stride(kDoubleStride);
+    }
+
+    const ProbeResult* best = nullptr;
+    for (const auto& cand : candidates) {
+        if (!cand.viable) {
+            continue;
+        }
+        if (cand.stride == kDoubleStride && !kAllowHighPrecisionStride) {
+            continue;
+        }
+        if (best == nullptr) {
+            best = &cand;
+            continue;
+        }
+        double score = cand.score;
+        double best_score = best->score;
+        if (std::fabs(score - best_score) < 1e-6) {
+            if (cand.stride == kShortStride && best->stride != kShortStride) {
+                best = &cand;
+            } else if (cand.coverage > best->coverage + 0.05) {
+                best = &cand;
+            }
+            continue;
+        }
+        if (score > best_score) {
+            best = &cand;
+        }
+    }
+
+    if (best == nullptr) {
+        return;
+    }
+
+    const size_t stride = best->stride;
+    const size_t start_offset = best->offset;
+
+    for (size_t offset = start_offset; offset + stride <= len; offset += stride) {
+        const uint8_t* rec = data + offset;
+        const uint64_t raw_time = ReadU64LE(rec);
+        if (raw_time == 0 || raw_time == std::numeric_limits<uint64_t>::max()) {
+            continue;
+        }
+
+        ImuSample sample;
+        sample.raw_time = static_cast<double>(raw_time);
+        sample.time_sec = std::numeric_limits<double>::quiet_NaN();
+        sample.is_video_ts = false;
+
+        if (!decode_record(rec, stride, sample)) {
             continue;
         }
 
