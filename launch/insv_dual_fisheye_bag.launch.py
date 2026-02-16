@@ -19,6 +19,7 @@ def generate_launch_description():
     jpeg_quality = LaunchConfiguration("jpeg_quality")
     encoding_threads = LaunchConfiguration("encoding_threads")
     decoder_threads = LaunchConfiguration("decoder_threads")
+    crop_ratio = LaunchConfiguration("crop_ratio")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -89,6 +90,11 @@ def generate_launch_description():
             default_value="0",
             description="FFmpeg decode threads for probing/streaming (0 = auto)"
         ),
+        DeclareLaunchArgument(
+            "crop_ratio",
+            default_value="0.75",
+            description="Center crop ratio (0 or 1 = disabled, (0,1) crops square)"
+        ),
         Node(
             package="insta360_ros_driver",
             executable="insv_dual_fisheye_bag_node",
@@ -108,6 +114,7 @@ def generate_launch_description():
                 "jpeg_quality": jpeg_quality,
                 "encoding_threads": encoding_threads,
                 "decoder_threads": decoder_threads,
+                "crop_ratio": crop_ratio,
             }]
         )
     ])

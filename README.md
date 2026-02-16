@@ -90,10 +90,11 @@ The [launch file](launch/insv_dual_fisheye_bag.launch.py) exposes the following 
 - `jpeg_quality` (default `50`) – Quality level (1–100) for JPEG encoding; ignored when `image_transport_format` is `png`.
 - `encoding_threads` (default `0`) – Number of worker threads used for image compression (`0` use all the cpu cores).
 - `decoder_threads` (default `0`) – Number of FFmpeg threads dedicated to video decoding (`0` use all the cpu cores).
+- `crop_ratio` (default `0.75`) - Center crop ratio (`0` or `1` = disabled, `(0,1)` crops square). Writes cropped images to `<topic>/cropped(/compressed)` if enabled.
 
 #### Saved Topics:
-- /insta360/front/image_raw(/compressed)
-- /insta360/rear/image_raw(/compressed)
+- /insta360/front/image_raw(/cropped/compressed)
+- /insta360/rear/image_raw(/cropped/compressed)
 - /insta360/imu
 
 IMU topic frequency is around **1000Hz** tested with INSV files recorded by Insta360 X5.
