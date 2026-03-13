@@ -39,7 +39,7 @@ private:
     static double ReadF64LE(const uint8_t* data);
 
     bool ParseTrailer(const std::vector<uint8_t>& trailer, std::vector<ImuSample>& out_samples, std::string* error_out) const;
-    bool ScanTailForRecords(const std::string& path, std::streamoff file_size, std::vector<ImuSample>& out_samples, std::string* error_out) const;
+    bool ScanTrailerWindow(const std::string& path, size_t start_offset, size_t window_size, std::vector<ImuSample>& out_samples, std::string* error_out) const;
     void ParseImuRecord(uint16_t id, const uint8_t* data, size_t len, std::vector<ImuSample>& out_samples) const;
     void ParseVideoTimestampRecord(uint16_t id, const uint8_t* data, size_t len, std::vector<ImuSample>& out_samples) const;
 };

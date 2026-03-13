@@ -99,6 +99,7 @@ def generate_launch_description():
             package="insta360_ros_driver",
             executable="insv_dual_fisheye_bag_node",
             name="insv_dual_fisheye_bag_node",
+            output="screen",
             parameters=[{
                 "file_path": file_path,
                 "bag_path": bag_path,

@@ -645,6 +645,7 @@ private:
                  crop_ratio = crop_ratio_]() mutable {
                     EncodedFrameResult result;
                     result.seq = seq;
+                    // TODO: is it necessary to extract this video offset?
                     const double stamp_sec = frame.t_video - offset_sec;
                     if (!std::isfinite(stamp_sec)) {
                         return result;
