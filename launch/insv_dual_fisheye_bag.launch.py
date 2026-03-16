@@ -16,6 +16,7 @@ def generate_launch_description():
     compressed_images = LaunchConfiguration("compressed_images")
     image_transport_format = LaunchConfiguration("image_transport_format")
     storage_id = LaunchConfiguration("storage_id")
+    time_window_margin_sec = LaunchConfiguration("time_window_margin_sec")
     jpeg_quality = LaunchConfiguration("jpeg_quality")
     encoding_threads = LaunchConfiguration("encoding_threads")
     decoder_threads = LaunchConfiguration("decoder_threads")
@@ -76,6 +77,11 @@ def generate_launch_description():
             description="Rosbag2 storage id: 'db3' (sqlite3) or 'mcap'"
         ),
         DeclareLaunchArgument(
+            "time_window_margin_sec",
+            default_value="0.05",
+            description="IMU Margin for time window (seconds)"
+        ),
+        DeclareLaunchArgument(
             "jpeg_quality",
             default_value="50",
             description="JPEG encoding quality (1-100). Ignored if image_transport_format is 'png'"
@@ -112,6 +118,7 @@ def generate_launch_description():
                 "compressed_images": compressed_images,
                 "image_transport_format": image_transport_format,
                 "storage_id": storage_id,
+                "time_window_margin_sec": time_window_margin_sec,
                 "jpeg_quality": jpeg_quality,
                 "encoding_threads": encoding_threads,
                 "decoder_threads": decoder_threads,
