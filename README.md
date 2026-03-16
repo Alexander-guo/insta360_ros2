@@ -76,7 +76,7 @@ Check parameters in [insv_dual_fisheye_bag_node.cpp](src/insv_dual_fisheye_bag_n
 
 #### Launch Arguments
 The [launch file](launch/insv_dual_fisheye_bag.launch.py) exposes the following arguments so you can tailor the conversion pipeline:
-- `file_path` (required) – Absolute path to the source `.insv` file that should be decoded.
+- `file_path` (required) – Path to a single `.insv`/`.lrv` file, or to a directory containing such files, that should be decoded (files in a directory are processed in sorted order).
 - `bag_path` (required) – Destination directory for the output rosbag2 recording; created if it does not exist.
 - `front_topic` (default `/insta360/front/image_raw`) – ROS topic receiving the front fisheye frames.
 - `rear_topic` (default `/insta360/rear/image_raw`) – ROS topic receiving the rear fisheye frames.
@@ -87,10 +87,12 @@ The [launch file](launch/insv_dual_fisheye_bag.launch.py) exposes the following 
 - `compressed_images` (default `true`) – When true, the node only writes `sensor_msgs/CompressedImage` under `<topic>/compressed` instead of raw images.
 - `image_transport_format` (default `jpeg`) – Encoding format for compressed images; switch to `png` for lossless storage.
 - `storage_id` (default `db3`) – rosbag2 storage backend (`db3` for SQLite, `mcap` for MCAP).
-- `jpeg_quality` (default `50`) – Quality level (1–100) for JPEG encoding; ignored when `image_transport_format` is `png`.
+- `jpeg_quality` (default `50`) – Quality level (1–100) for `JPEG` encoding; ignored when `image_transport_format` is `png`.
 - `encoding_threads` (default `0`) – Number of worker threads used for image compression (`0` use all the cpu cores).
 - `decoder_threads` (default `0`) – Number of FFmpeg threads dedicated to video decoding (`0` use all the cpu cores).
 - `crop_ratio` (default `0.75`) - Center crop ratio (`0` or `1` = disabled, `(0,1)` crops square). Writes cropped images to `<topic>/cropped(/compressed)` if enabled.
+- `time_window_margin_sec` (default `0.05`) - Time padding (in seconds) added before the first and after the last video frame when filtering and validating IMU samples. If processing multiple videos, this margin is decided automatically based on the interval between video frames.
+- `save_images` (default `true`) - If true, save images to the rosbag2; if false, only save IMU data (useful for debugging or when images are not needed).
 
 #### Saved Topics:
 - /insta360/front/image_raw(/cropped/compressed)

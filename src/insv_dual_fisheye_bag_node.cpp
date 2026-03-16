@@ -3,13 +3,17 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 #include <rclcpp/rclcpp.hpp>
@@ -130,13 +134,14 @@ public:
         declare_parameter<double>("time_window_margin_sec", 0.05);
         declare_parameter<double>("crop_ratio", 0.0);
         declare_parameter<int>("jpeg_quality", 90);
+        declare_parameter<bool>("save_images", true);
         const unsigned int hw_threads = std::thread::hardware_concurrency();
         const int default_threads = hw_threads > 0 ? static_cast<int>(hw_threads) : 4;
         const int decoder_default_threads = hw_threads > 0 ? std::min(default_threads, 16) : 4;
         declare_parameter<int>("encoding_threads", default_threads);
         declare_parameter<int>("decoder_threads", decoder_default_threads);
 
-        file_path_ = get_parameter("file_path").as_string();
+        const std::string file_path_param = get_parameter("file_path").as_string();
         bag_path_ = get_parameter("bag_path").as_string();
         front_topic_ = get_parameter("front_topic").as_string();
         rear_topic_ = get_parameter("rear_topic").as_string();
@@ -147,8 +152,9 @@ public:
         compressed_images_ = get_parameter("compressed_images").as_bool();
         image_transport_format_ = get_parameter("image_transport_format").as_string();
         storage_id_param_ = get_parameter("storage_id").as_string();
-        time_window_margin_sec_ = get_parameter("time_window_margin_sec").as_double();
+        time_window_margin_sec_ = get_parameter("time_window_margin_sec").as_double(); 
         crop_ratio_ = get_parameter("crop_ratio").as_double();
+        save_images_ = get_parameter("save_images").as_bool();
         {
             int q = get_parameter("jpeg_quality").as_int();
             if (q < 1) q = 1;
@@ -185,6 +191,11 @@ public:
             crop_ratio_ = 0.0;
         }
 
+        if (bag_path_.empty()) {
+            RCLCPP_ERROR(get_logger(), "Parameter 'bag_path' is required");
+            return;
+        }
+
         // Map user-friendly values to rosbag2 storage IDs
         if (storage_id_param_ == "db3" || storage_id_param_ == "sqlite" || storage_id_param_ == "sqlite3") {
             storage_id_param_ = "sqlite3";
@@ -195,209 +206,27 @@ public:
             storage_id_param_ = "sqlite3";
         }
 
-        if (file_path_.empty() || bag_path_.empty()) {
-            RCLCPP_ERROR(get_logger(), "Parameters 'file_path' and 'bag_path' are required");
-            return;
-        }
-
         if (!InitBagWriter()) {
             RCLCPP_ERROR(get_logger(), "Failed to initialize rosbag2 writer");
             return;
         }
 
-        // Parse trailer IMU and VideoTimeStamp
-        insta360_insv::TrailerParser parser;
-        std::vector<insta360_insv::ImuSample> trailer_samples;
-        std::string err;
-        if (!parser.ParseFile(file_path_, trailer_samples, &err)) {
-            RCLCPP_ERROR(get_logger(), "Failed to parse trailer: %s", err.c_str());
+        if (!LoadFilePaths(file_path_param)) {
+            RCLCPP_ERROR(get_logger(), "Parameter 'file_path' must be a valid file or directory containing .insv/.lrv files");
             return;
         }
-        for (const auto& s : trailer_samples) {
-            if (s.is_video_ts) {
-                video_ts_raw_.push_back(s.raw_time);
-            } else {
-                imu_samples_.push_back(s);
-            }
-        }
-        // Stats on IMU record encoding
-        if (!imu_samples_.empty()) {
-            size_t hp = 0, sp = 0;
-            for (const auto& s : imu_samples_) {
-                if (s.high_precision) hp++; else sp++;
-            }
-            RCLCPP_INFO(get_logger(), "IMU records parsed: %zu total (double=%zu, short=%zu)", imu_samples_.size(), hp, sp);
-        }
-        if (!video_ts_raw_.empty()) {
-            std::sort(video_ts_raw_.begin(), video_ts_raw_.end());
-            video_ts_raw_.erase(std::unique(video_ts_raw_.begin(), video_ts_raw_.end()), video_ts_raw_.end());
-        }
-        if (!imu_samples_.empty()) {
-            std::sort(imu_samples_.begin(), imu_samples_.end(), [](const insta360_insv::ImuSample& lhs, const insta360_insv::ImuSample& rhs) {
-                return lhs.raw_time < rhs.raw_time;
-            });
-        }
-        if (video_ts_raw_.empty()) {
-            RCLCPP_WARN(get_logger(), "No video timestamps (0x600) found; alignment will use zero offset");
+        
+        if (file_paths_.size() > 1) {
+            multi_files_ = true;
+            RCLCPP_INFO(get_logger(), "Found %zu files to process", file_paths_.size());        
         }
 
-        // Probe video timestamps first to derive a reliable window without buffering frames
-        {
-            insta360_insv::InsvVideoDecoder decoder(file_path_, decoder_threads_);
-            std::string derr;
-            if (!decoder.open(&derr)) {
-                RCLCPP_ERROR(get_logger(), "Decoder open failed: %s", derr.c_str());
-                return;
+        for (const auto& path : file_paths_) {
+            RCLCPP_INFO(get_logger(), "\nProcessing file: %s", path.c_str());
+            if (!ProcessFile(path)) {
+                RCLCPP_ERROR(get_logger(), "Failed to process file: %s", path.c_str());
             }
-
-            double vmin = 0.0;
-            double vmax = 0.0;
-            if (!decoder.probe_time_window(vmin, vmax, &derr)) {
-                RCLCPP_ERROR(get_logger(), "Failed to probe video timestamps: %s", derr.c_str());
-                return;
-            }
-
-            if (!std::isfinite(vmin) || !std::isfinite(vmax)) {
-                RCLCPP_ERROR(get_logger(), "Video timestamps are not finite (min=%.3f max=%.3f)", vmin, vmax);
-                return;
-            }
-
-            video_min_sec_ = vmin;
-            video_max_sec_ = vmax;
-            video_dur_sec_ = std::max(0.0, video_max_sec_ - video_min_sec_);
         }
-
-        // Align IMU raw timestamps to video timestamps with robust filtering.
-        if (!imu_samples_.empty()) {
-            // Use video window from decoded frames
-            const double video_start_sec = video_min_sec_;
-            const double video_dur = video_dur_sec_;
-            // Build a list of plausible raw times to infer scale (reject extremes poisoning span)
-            std::vector<double> valid_raw;
-            valid_raw.reserve(imu_samples_.size());
-            for (const auto& s : imu_samples_) {
-                if (std::isfinite(s.raw_time) && s.raw_time > 0.0 && s.raw_time < 1e12) {
-                    valid_raw.push_back(s.raw_time);
-                }
-            }
-            double min_raw = imu_samples_.front().raw_time;
-            double max_raw = imu_samples_.front().raw_time;
-            if (!valid_raw.empty()) {
-                auto [mn_it, mx_it] = std::minmax_element(valid_raw.begin(), valid_raw.end());
-                min_raw = *mn_it;
-                max_raw = *mx_it;
-            } else {
-                for (const auto& s : imu_samples_) {
-                    if (s.raw_time < min_raw) min_raw = s.raw_time;
-                    if (s.raw_time > max_raw) max_raw = s.raw_time;
-                }
-            }
-            const double span = max_raw - min_raw;
-            // Detect IMU scale from its own span only (µs vs ms)
-            imu_time_scale_ = (span > 1e6 ? 1e-6 : 1e-3);
-
-            // Estimate offset to anchor IMU start to video start (first valid IMU)
-            imu_time_offset_ = 0.0;
-            if (std::isfinite(video_start_sec)) {
-                double imu_ref = std::numeric_limits<double>::quiet_NaN();
-                for (const auto& s : imu_samples_) {
-                    if (s.raw_time > 0.0 && s.raw_time < 1e16) { // sanity
-                        imu_ref = s.raw_time * imu_time_scale_;
-                        break;
-                    }
-                }
-                if (std::isfinite(imu_ref)) {
-                    imu_time_offset_ = video_start_sec - imu_ref;
-                }
-            }
-
-            // Filter by duration bound and monotonicity on raw_time; then compute aligned time
-            const double video_min = std::isfinite(video_start_sec) ? video_start_sec : std::numeric_limits<double>::quiet_NaN();
-            const double video_max = (std::isfinite(video_start_sec) && std::isfinite(video_dur)) ? (video_start_sec + video_dur) : std::numeric_limits<double>::quiet_NaN();
-            // Keep existing member window (already set from frames)
-
-            std::vector<insta360_insv::ImuSample> cleaned;
-            cleaned.reserve(imu_samples_.size());
-            size_t dropped_ts_range = 0;
-            size_t dropped_non_mono = 0;
-            double last_raw = -1.0;
-            for (const auto& s : imu_samples_) {
-                const double rt = s.raw_time;
-                if (!(rt > 0.0 && std::isfinite(rt))) {
-                    ++dropped_ts_range;
-                    continue;
-                }
-                if (rt < min_raw || rt > max_raw) {
-                    ++dropped_ts_range;
-                    continue;
-                }
-                // Use aligned IMU time against absolute video window
-                if (std::isfinite(video_min) && std::isfinite(video_max)) {
-                    const double sec_aligned = rt * imu_time_scale_ + imu_time_offset_;
-                    if (!(sec_aligned >= video_min - time_window_margin_sec_ && sec_aligned <= video_max + time_window_margin_sec_)) {
-                        ++dropped_ts_range;
-                        continue;
-                    }
-                }
-                if (last_raw >= 0.0 && rt <= last_raw) {
-                    ++dropped_non_mono;
-                    continue;
-                }
-                last_raw = rt;
-                cleaned.push_back(s);
-            }
-
-            if (!cleaned.empty()) {
-                imu_samples_.swap(cleaned);
-            }
-
-            for (auto& s : imu_samples_) {
-                s.time_sec = s.raw_time * imu_time_scale_ + imu_time_offset_;
-            }
-
-            // Drop IMU samples that still fall outside the computed video window after alignment
-            size_t dropped_beyond_window = 0;
-            if (std::isfinite(video_min) && std::isfinite(video_max)) {
-                std::vector<insta360_insv::ImuSample> windowed;
-                windowed.reserve(imu_samples_.size());
-                for (const auto& s : imu_samples_) {
-                    if (s.time_sec < video_min - time_window_margin_sec_ || s.time_sec > video_max + time_window_margin_sec_) {
-                        ++dropped_beyond_window;
-                        continue;
-                    }
-                    windowed.push_back(s);
-                }
-                if (!windowed.empty()) {
-                    imu_samples_.swap(windowed);
-                }
-            }
-
-            RCLCPP_INFO(get_logger(),
-                        "IMU time alignment: raw_min=%.3f raw_max=%.3f span=%.3f scale=%.6g offset=%.6f video_start=%.6f video_dur=%.3f dropped_range=%zu dropped_nonmono=%zu dropped_outside=%zu kept=%zu",
-                        min_raw, max_raw, span, imu_time_scale_, imu_time_offset_,
-                        video_min, std::isfinite(video_dur) ? video_dur : -1.0, dropped_ts_range, dropped_non_mono, dropped_beyond_window, imu_samples_.size());
-        }
-
-        if (!imu_samples_.empty()) {
-            double imu_min = imu_samples_.front().time_sec;
-            double imu_max = imu_samples_.back().time_sec;
-
-            RCLCPP_WARN(
-                get_logger(),
-                "FINAL WINDOW: video [%.3f, %.3f], imu [%.3f, %.3f]",
-                video_min_sec_, video_max_sec_, imu_min, imu_max);
-        } else {
-            RCLCPP_WARN(
-                get_logger(),
-                "FINAL WINDOW: video [%.3f, %.3f], imu [no samples remain after filtering]",
-                video_min_sec_, video_max_sec_);
-        }
-
-        // Write IMU samples first (now clamped to the video window)
-        WriteImuSamples();
-
-        // Write dual fisheye frames (reuse decoded frames)
-        DecodeAndWriteVideo();
     }
 
 private:
@@ -480,6 +309,269 @@ private:
         return true;
     }
 
+    bool LoadFilePaths(const std::string& path) {
+        file_paths_.clear();
+        if (path.empty()) {
+            return false;
+        }
+
+        std::error_code ec;
+        const std::filesystem::path p(path);
+        if (std::filesystem::is_directory(p, ec)) {
+            for (const auto& entry : std::filesystem::directory_iterator(p, ec)) {
+                if (ec) {
+                    break;
+                }
+                if (!entry.is_regular_file()) {
+                    continue;
+                }
+                const auto ext = entry.path().extension().string();
+                std::string ext_lower;
+                ext_lower.resize(ext.size());
+                std::transform(ext.begin(), ext.end(), ext_lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (ext_lower == ".insv" || ext_lower == ".lrv") {
+                    file_paths_.push_back(entry.path().string());
+                }
+            }
+            std::sort(file_paths_.begin(), file_paths_.end());
+        } else if (std::filesystem::is_regular_file(p, ec)) {
+            file_paths_.push_back(path);
+        }
+
+        if (file_paths_.empty()) {
+            return false;
+        }
+        return true;
+    }
+
+    bool ProcessFile(const std::string& path) {
+        ResetPerFileState();
+        file_path_ = path;
+        RCLCPP_INFO(get_logger(), "Current global_time_offset_sec: %.3f", global_time_offset_sec_);
+
+        if (!ParseTrailer(path)) {
+            return false;
+        }
+        if (!ProbeVideoWindow()) {
+            return false;
+        }
+        AlignImu();
+        WriteImuSamples();
+        if (save_images_) {
+            DecodeAndWriteVideo();
+        }
+
+        if (std::isfinite(video_dur_sec_)) {
+            global_time_offset_sec_ += video_dur_sec_ + frame_interval_sec_;
+        }
+        return true;
+    }
+
+    void ResetPerFileState() {
+        imu_samples_.clear();
+        video_ts_raw_.clear();
+        video_min_sec_ = std::numeric_limits<double>::quiet_NaN();
+        video_max_sec_ = std::numeric_limits<double>::quiet_NaN();
+        video_dur_sec_ = std::numeric_limits<double>::quiet_NaN();
+        frame_interval_sec_ = 0.001;
+        imu_time_scale_ = 1e-3;
+        imu_time_offset_ = 0.0;
+    }
+
+    bool ParseTrailer(const std::string& file) {
+        insta360_insv::TrailerParser parser;
+        std::vector<insta360_insv::ImuSample> trailer_samples;
+        std::string err;
+        if (!parser.ParseFile(file, trailer_samples, &err)) {
+            RCLCPP_ERROR(get_logger(), "Failed to parse trailer: %s", err.c_str());
+            return false;
+        }
+        for (const auto& s : trailer_samples) {
+            if (s.is_video_ts) {
+                video_ts_raw_.push_back(s.raw_time);
+            } else {
+                imu_samples_.push_back(s);
+            }
+        }
+        if (!video_ts_raw_.empty()) {
+            std::sort(video_ts_raw_.begin(), video_ts_raw_.end());
+            video_ts_raw_.erase(std::unique(video_ts_raw_.begin(), video_ts_raw_.end()), video_ts_raw_.end());
+            // TODO: consider the scale of video_ts_raw_
+            // double span_raw = video_ts_raw_.back() - video_ts_raw_.front();
+            // RCLCPP_INFO(get_logger(), "Trailer video_ts_raw: raw span=%.3f, count=%zu, video_ts_raw_start=%.3f, video_ts_raw_end=%.3f" \
+            //     frame_interval_sec_, span_raw, video_ts_raw_.size(), video_ts_raw_.front(), video_ts_raw_.back());
+        } else {
+            RCLCPP_WARN(get_logger(), "No video timestamps (0x600) found; alignment will use zero offset");
+        }
+        if (!imu_samples_.empty()) {
+            std::sort(imu_samples_.begin(), imu_samples_.end(), [](const insta360_insv::ImuSample& lhs, const insta360_insv::ImuSample& rhs) {
+                return lhs.raw_time < rhs.raw_time;
+            });
+            size_t hp = 0, sp = 0;
+            for (const auto& s : imu_samples_) {
+                if (s.high_precision) {
+                    hp++;
+                } else {
+                    sp++;
+                }
+            }
+            RCLCPP_INFO(get_logger(), "IMU records parsed: %zu total (double=%zu, short=%zu)", imu_samples_.size(), hp, sp);
+        }
+        return true;
+    }
+
+    bool ProbeVideoWindow() {
+        insta360_insv::InsvVideoDecoder decoder(file_path_, decoder_threads_);
+        std::string derr;
+        if (!decoder.open(&derr)) {
+            RCLCPP_ERROR(get_logger(), "Decoder open failed: %s", derr.c_str());
+            return false;
+        }
+
+        double vmin = 0.0;
+        double vmax = 0.0;
+        std::size_t frame_count = 0;
+        if (!decoder.probe_time_window(vmin, vmax, &frame_count, &derr)) {
+            RCLCPP_ERROR(get_logger(), "Failed to probe video timestamps: %s", derr.c_str());
+            return false;
+        }
+
+        if (!std::isfinite(vmin) || !std::isfinite(vmax)) {
+            RCLCPP_ERROR(get_logger(), "Video timestamps are not finite (min=%.3f max=%.3f)", vmin, vmax);
+            return false;
+        }
+
+        video_min_sec_ = vmin;
+        video_max_sec_ = vmax;
+        video_dur_sec_ = std::max(0.0, video_max_sec_ - video_min_sec_);
+
+        // Estimate frame interval 
+        double avg_vid_gap_sec = video_dur_sec_ / std::max<size_t>(frame_count - 1, 1);
+        frame_interval_sec_ = avg_vid_gap_sec;
+        if (multi_files_) { 
+            time_window_margin_sec_ = avg_vid_gap_sec; 
+        }
+        RCLCPP_INFO(get_logger(), "Probed video window: [%.3f, %.3f] sec (duration=%.3f sec, frame_count=%zu), estimated frame interval=%.3f sec, time_window_margin_sec_: %.3f", \
+            video_min_sec_, video_max_sec_, video_dur_sec_, frame_count, avg_vid_gap_sec, time_window_margin_sec_);
+
+        return true;
+    }
+
+    void AlignImu() {
+        if (imu_samples_.empty()) {
+            RCLCPP_WARN(get_logger(), "FINAL WINDOW: video [%.3f, %.3f], imu [no samples remain after filtering]", video_min_sec_, video_max_sec_);
+            return;
+        }
+
+        const double video_start_sec = video_min_sec_;
+        const double video_dur = video_dur_sec_;
+        std::vector<double> valid_raw;
+        valid_raw.reserve(imu_samples_.size());
+        for (const auto& s : imu_samples_) {
+            if (std::isfinite(s.raw_time) && s.raw_time > 0.0 && s.raw_time < 1e12) {
+                valid_raw.push_back(s.raw_time);
+            }
+        }
+        double min_raw = imu_samples_.front().raw_time;
+        double max_raw = imu_samples_.front().raw_time;
+        if (!valid_raw.empty()) {
+            auto [mn_it, mx_it] = std::minmax_element(valid_raw.begin(), valid_raw.end());
+            min_raw = *mn_it;
+            max_raw = *mx_it;
+        } else {
+            for (const auto& s : imu_samples_) {
+                if (s.raw_time < min_raw) min_raw = s.raw_time;
+                if (s.raw_time > max_raw) max_raw = s.raw_time;
+            }
+        }
+        const double span = max_raw - min_raw;
+        imu_time_scale_ = (span > 1e6 ? 1e-6 : 1e-3);
+
+        imu_time_offset_ = 0.0;
+        if (std::isfinite(video_start_sec)) {
+            double imu_ref = std::numeric_limits<double>::quiet_NaN();
+            for (const auto& s : imu_samples_) {
+                if (s.raw_time > 0.0 && s.raw_time < 1e16) {
+                    imu_ref = s.raw_time * imu_time_scale_;
+                    break;
+                }
+            }
+            if (std::isfinite(imu_ref)) {
+                imu_time_offset_ = video_start_sec - imu_ref;
+            }
+        }
+
+        const double video_min = std::isfinite(video_start_sec) ? video_start_sec : std::numeric_limits<double>::quiet_NaN();
+        const double video_max = (std::isfinite(video_start_sec) && std::isfinite(video_dur)) ? (video_start_sec + video_dur) : std::numeric_limits<double>::quiet_NaN();
+
+        std::vector<insta360_insv::ImuSample> cleaned;
+        cleaned.reserve(imu_samples_.size());
+        size_t dropped_ts_range = 0;
+        size_t dropped_non_mono = 0;
+        double last_raw = -1.0;
+        for (const auto& s : imu_samples_) {
+            const double rt = s.raw_time;
+            if (!(rt > 0.0 && std::isfinite(rt))) {
+                ++dropped_ts_range;
+                continue;
+            }
+            if (rt < min_raw || rt > max_raw) {
+                ++dropped_ts_range;
+                continue;
+            }
+            if (std::isfinite(video_min) && std::isfinite(video_max)) {
+                const double sec_aligned = rt * imu_time_scale_ + imu_time_offset_;
+                if (!(sec_aligned >= video_min - time_window_margin_sec_ && sec_aligned <= video_max + time_window_margin_sec_)) {
+                    ++dropped_ts_range;
+                    continue;
+                }
+            }
+            if (last_raw >= 0.0 && rt <= last_raw) {
+                ++dropped_non_mono;
+                continue;
+            }
+            last_raw = rt;
+            cleaned.push_back(s);
+        }
+
+        if (!cleaned.empty()) {
+            imu_samples_.swap(cleaned);
+        }
+
+        for (auto& s : imu_samples_) {
+            s.time_sec = s.raw_time * imu_time_scale_ + imu_time_offset_;
+        }
+
+        size_t dropped_beyond_window = 0;
+        if (std::isfinite(video_min) && std::isfinite(video_max)) {
+            std::vector<insta360_insv::ImuSample> windowed;
+            windowed.reserve(imu_samples_.size());
+            for (const auto& s : imu_samples_) {
+                if (s.time_sec < video_min - time_window_margin_sec_ || s.time_sec > video_max + time_window_margin_sec_) {
+                    ++dropped_beyond_window;
+                    continue;
+                }
+                windowed.push_back(s);
+            }
+            if (!windowed.empty()) {
+                imu_samples_.swap(windowed);
+            }
+        }
+
+        if (!imu_samples_.empty()) {
+            const double imu_min = imu_samples_.front().time_sec;
+            const double imu_max = imu_samples_.back().time_sec;
+            RCLCPP_WARN(get_logger(), "FINAL WINDOW: video [%.3f, %.3f], imu [%.3f, %.3f]", video_min_sec_, video_max_sec_, imu_min, imu_max);
+        } else {
+            RCLCPP_WARN(get_logger(), "FINAL WINDOW: video [%.3f, %.3f], imu [no samples remain after filtering]", video_min_sec_, video_max_sec_);
+        }
+
+        RCLCPP_INFO(get_logger(),
+                    "IMU time alignment: raw_min=%.3f raw_max=%.3f span=%.3f scale=%.6g offset=%.6f video_start=%.6f video_dur=%.3f dropped_range=%zu dropped_nonmono=%zu dropped_outside=%zu kept=%zu",
+                    min_raw, max_raw, span, imu_time_scale_, imu_time_offset_,
+                    video_min, std::isfinite(video_dur) ? video_dur : -1.0, dropped_ts_range, dropped_non_mono, dropped_beyond_window, imu_samples_.size());
+    }
+
     void WriteImuSamples() {
         rclcpp::Serialization<sensor_msgs::msg::Imu> serializer;
         size_t skipped = 0;
@@ -516,7 +608,12 @@ private:
                 }
                 continue;
             }
-            const int64_t stamp_ns = static_cast<int64_t>(s.time_sec * 1e9);
+            const double aligned_time = s.time_sec + global_time_offset_sec_;
+            if (aligned_time <= last_written_imu_time_) {
+                ++skipped;
+                continue;
+            }
+            const int64_t stamp_ns = static_cast<int64_t>(aligned_time * 1e9);
             const rclcpp::Time stamp(stamp_ns);
             sensor_msgs::msg::Imu msg;
             msg.header.stamp = stamp;
@@ -541,6 +638,7 @@ private:
             std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
                 std::make_shared<rclcpp::SerializedMessage>(serialized);
             writer_.write(serialized_ptr, imu_topic_, "sensor_msgs/msg/Imu", stamp);
+            last_written_imu_time_ = aligned_time;
         }
         if (skipped > 0) {
             RCLCPP_WARN(get_logger(), "Skipped %zu IMU samples with invalid timestamps", skipped);
@@ -642,11 +740,11 @@ private:
                  frame_id_front = frame_id_front_,
                  frame_id_rear = frame_id_rear_,
                  crop_enabled = crop_enabled_,
-                 crop_ratio = crop_ratio_]() mutable {
+                 crop_ratio = crop_ratio_,
+                 global_offset = global_time_offset_sec_]() mutable {
                     EncodedFrameResult result;
                     result.seq = seq;
-                    // TODO: is it necessary to extract this video offset?
-                    const double stamp_sec = frame.t_video - offset_sec;
+                    const double stamp_sec = frame.t_video - offset_sec + global_offset;
                     if (!std::isfinite(stamp_sec)) {
                         return result;
                     }
@@ -774,6 +872,7 @@ private:
     }
 
     // Params
+    std::vector<std::string> file_paths_;
     std::string file_path_;
     std::string bag_path_;
     std::string front_topic_;
@@ -782,6 +881,12 @@ private:
     std::string frame_id_front_;
     std::string frame_id_rear_;
     std::string imu_frame_id_;
+
+    bool save_images_{true};
+    bool multi_files_{false};
+
+    double global_time_offset_sec_{0.0};
+    double last_written_imu_time_{-std::numeric_limits<double>::infinity()};
 
     // Trailer data
     std::vector<double> video_ts_raw_;
@@ -797,6 +902,7 @@ private:
     double video_min_sec_{std::numeric_limits<double>::quiet_NaN()};
     double video_max_sec_{std::numeric_limits<double>::quiet_NaN()};
     double video_dur_sec_{std::numeric_limits<double>::quiet_NaN()};
+    double frame_interval_sec_{0.001};
     double time_window_margin_sec_{0.05};
     double crop_ratio_{0.0};
     int jpeg_quality_{90};

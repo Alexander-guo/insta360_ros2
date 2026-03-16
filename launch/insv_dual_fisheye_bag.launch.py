@@ -21,6 +21,7 @@ def generate_launch_description():
     encoding_threads = LaunchConfiguration("encoding_threads")
     decoder_threads = LaunchConfiguration("decoder_threads")
     crop_ratio = LaunchConfiguration("crop_ratio")
+    save_images = LaunchConfiguration("save_images")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -101,6 +102,11 @@ def generate_launch_description():
             default_value="0.75",
             description="Center crop ratio (0 or 1 = disabled, (0,1) crops square)"
         ),
+        DeclareLaunchArgument(
+            "save_images",
+            default_value="true",
+            description="If true, save images to the rosbag2; if false, only save IMU data (useful for debugging or when images are not needed)"
+        ),
         Node(
             package="insta360_ros_driver",
             executable="insv_dual_fisheye_bag_node",
@@ -123,6 +129,7 @@ def generate_launch_description():
                 "encoding_threads": encoding_threads,
                 "decoder_threads": decoder_threads,
                 "crop_ratio": crop_ratio,
+                "save_images": save_images,
             }]
         )
     ])

@@ -588,7 +588,7 @@ void TrailerParser::ParseImuRecord(uint16_t /*id*/, const uint8_t* data, size_t 
     if (kDebugScanRegions) {
         static bool announced = false;
         if (!announced) {
-                        printf("INSTA360_DEBUG_IMU_REGIONS enabled; scanning IMU records (min region env: INSTA360_DEBUG_IMU_MIN_REGION)\n");
+            printf("INSTA360_DEBUG_IMU_REGIONS enabled; scanning IMU records (min region env: INSTA360_DEBUG_IMU_MIN_REGION)\n");
             fflush(stdout);
             announced = true;
         }
