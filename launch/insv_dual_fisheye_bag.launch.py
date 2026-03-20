@@ -22,6 +22,7 @@ def generate_launch_description():
     decoder_threads = LaunchConfiguration("decoder_threads")
     crop_ratio = LaunchConfiguration("crop_ratio")
     save_images = LaunchConfiguration("save_images")
+    verbose = LaunchConfiguration("verbose")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -107,6 +108,11 @@ def generate_launch_description():
             default_value="true",
             description="If true, save images to the rosbag2; if false, only save IMU data (useful for debugging or when images are not needed)"
         ),
+        DeclareLaunchArgument(
+            "verbose",
+            default_value="false",
+            description="If true, print verbose logs during trailer parsing, helpful for debugging or understanding the trailer structure"
+        ),
         Node(
             package="insta360_ros_driver",
             executable="insv_dual_fisheye_bag_node",
@@ -121,6 +127,7 @@ def generate_launch_description():
                 "frame_id_front": frame_id_front,
                 "frame_id_rear": frame_id_rear,
                 "imu_frame_id": imu_frame_id,
+                "verbose": verbose,
                 "compressed_images": compressed_images,
                 "image_transport_format": image_transport_format,
                 "storage_id": storage_id,
