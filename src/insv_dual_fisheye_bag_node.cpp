@@ -220,7 +220,8 @@ public:
         
         if (file_paths_.size() > 1) {
             multi_files_ = true;
-            RCLCPP_INFO(get_logger(), "Found %zu files to process", file_paths_.size());        
+            time_window_margin_sec_ = 0.0;
+            RCLCPP_INFO(get_logger(), "Found %zu files to process", file_paths_.size());
         }
 
         for (const auto& path : file_paths_) {
@@ -364,7 +365,8 @@ private:
         }
 
         if (std::isfinite(video_dur_sec_)) {
-            global_time_offset_sec_ += video_dur_sec_ + frame_interval_sec_;
+            global_time_offset_sec_ += video_dur_sec_ - video_frame_overlap_sec_;
+            last_video_trailer_lft_sec_ = curr_video_trailer_fft_sec_ + video_dur_sec_;
         }
         return true;
     }
@@ -375,6 +377,7 @@ private:
         video_max_sec_ = std::numeric_limits<double>::quiet_NaN();
         video_dur_sec_ = std::numeric_limits<double>::quiet_NaN();
         frame_interval_sec_ = 0.001;
+        video_frame_overlap_sec_ = 0.0;
     }
 
     bool ParseTrailer(const std::string& file) {
@@ -385,6 +388,13 @@ private:
             RCLCPP_ERROR(get_logger(), "Failed to parse trailer: %s", err.c_str());
             return false;
         }
+
+        curr_video_trailer_fft_sec_ = parser.GetMetadataState().have_first_frame_timestamp ? 
+            parser.GetMetadataState().first_frame_timestamp_sec : std::numeric_limits<double>::quiet_NaN();
+        video_frame_overlap_sec_ = std::isfinite(last_video_trailer_lft_sec_) ? last_video_trailer_lft_sec_ - curr_video_trailer_fft_sec_ : 0.0;
+        RCLCPP_INFO(get_logger(), "Video frame overlap between files: %.3f sec (current trailer FFT=%.3f sec, last trailer LFT=%.3f sec)", 
+            video_frame_overlap_sec_, curr_video_trailer_fft_sec_, last_video_trailer_lft_sec_);
+
         if (!imu_samples_.empty()) {
             RCLCPP_INFO(get_logger(), "IMU records parsed: %zu total, timestamp interval=[%.3f, %.3f]", 
                 imu_samples_.size(), imu_samples_.front().time_sec, imu_samples_.back().time_sec);
@@ -422,9 +432,9 @@ private:
         // Estimate frame interval 
         double avg_vid_gap_sec = video_dur_sec_ / std::max<size_t>(frame_count - 1, 1);
         frame_interval_sec_ = avg_vid_gap_sec;
-        if (multi_files_) { 
-            time_window_margin_sec_ = avg_vid_gap_sec; 
-        }
+        // if (multi_files_) { 
+        //     time_window_margin_sec_ = avg_vid_gap_sec; 
+        // }
         RCLCPP_INFO(get_logger(), "Probed video window: [%.3f, %.3f] sec (duration=%.3f sec, frame_count=%zu), estimated frame interval=%.3f sec, time_window_margin_sec_: %.3f", \
             video_min_sec_, video_max_sec_, video_dur_sec_, frame_count, avg_vid_gap_sec, time_window_margin_sec_);
 
@@ -463,8 +473,8 @@ private:
         rclcpp::Serialization<sensor_msgs::msg::Imu> serializer;
         size_t skipped = 0;
         for (const auto& s : imu_samples_) {
-            const double aligned_time = s.time_sec + global_time_offset_sec_;
-            if (aligned_time <= last_written_imu_time_) {
+            const double aligned_time = s.time_sec + global_time_offset_sec_ - video_frame_overlap_sec_;
+            if (s.time_sec <= video_frame_overlap_sec_) {
                 ++skipped;
                 continue;
             }
@@ -497,7 +507,7 @@ private:
             last_written_imu_time_ = aligned_time;
         }
         if (skipped > 0) {
-            RCLCPP_WARN(get_logger(), "Skipped %zu IMU samples with invalid timestamps", skipped);
+            RCLCPP_WARN(get_logger(), "Skipped %zu IMU samples due to video frames overlap between files", skipped);
         }
         RCLCPP_INFO(get_logger(), "Wrote %zu IMU samples", imu_samples_.size() - skipped);
     }
@@ -585,10 +595,15 @@ private:
                  frame_id_rear = frame_id_rear_,
                  crop_enabled = crop_enabled_,
                  crop_ratio = crop_ratio_,
+                 video_frame_overlap_sec = video_frame_overlap_sec_,
                  global_offset = global_time_offset_sec_]() mutable {
                     EncodedFrameResult result;
                     result.seq = seq;
-                    const double stamp_sec = frame.t_video + global_offset;
+                    const double stamp_sec = frame.t_video + global_offset - video_frame_overlap_sec;
+                    if (frame.t_video <= video_frame_overlap_sec) {
+                        // Skip frames that are within the overlap region between files, since their timestamps may not be unique after alignment
+                        if (global_offset != 0.0) { return result; }
+                    }
                     if (!std::isfinite(stamp_sec)) {
                         return result;
                     }
@@ -710,7 +725,7 @@ private:
             RCLCPP_WARN(get_logger(), "Stream decode produced zero frames");
         }
         if (skipped_frames > 0) {
-            RCLCPP_WARN(get_logger(), "Skipped %zu frames with invalid timestamps or encoding failures", skipped_frames);
+            RCLCPP_WARN(get_logger(), "Skipped %zu video frames with invalid/overlapping timestamps or encoding failures", skipped_frames);
         }
         RCLCPP_INFO(get_logger(), "Wrote %zu video frames (front+rear)", frames_written);
     }
@@ -731,6 +746,9 @@ private:
 
     double global_time_offset_sec_{0.0};
     double last_written_imu_time_{-std::numeric_limits<double>::infinity()};
+    double last_video_trailer_lft_sec_{-std::numeric_limits<double>::infinity()}; // last frame timestamp of video 
+    double curr_video_trailer_fft_sec_{std::numeric_limits<double>::quiet_NaN()}; // first_frame_timestamp from trailer
+    double video_frame_overlap_sec_{0.0}; // video frame overlap between files: max(0, last_video_trailer_lft_sec - curr_video_trailer_fft_sec)
 
     // Trailer data
     std::vector<insta360_insv::ImuSample> imu_samples_;

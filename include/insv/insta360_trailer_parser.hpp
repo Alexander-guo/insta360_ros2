@@ -31,20 +31,6 @@ public:
         uint32_t rel_offset{0};
     };
 
-    // Parse an INSV/LRV/MP4 file containing an Insta360 trailer and collect samples.
-    // Returns true on success. When false, error_out (if provided) contains a brief reason.
-    bool ParseFile(const std::string& path, std::vector<ImuSample>& out_samples, std::string* error_out = nullptr) const;
-
-    void SetVerbose(bool verbose) const { verbose_ = verbose; }
-
-private:
-    struct ImuCalibration {
-        bool have_ranges{false};
-        bool is_raw_gyro{false};
-        double gyro_range{2000.0};  // deg/s
-        double acc_range{16.0};     // g
-    };
-
     struct ExtraMetadataState {
         std::string model;
         bool have_first_frame_timestamp{false};
@@ -55,6 +41,22 @@ private:
         bool have_frame_readout_time{false};
         double frame_readout_time{0.0};
         bool has_offset_v3{false};
+    };
+
+    // Parse an INSV/LRV/MP4 file containing an Insta360 trailer and collect samples.
+    // Returns true on success. When false, error_out (if provided) contains a brief reason.
+    bool ParseFile(const std::string& path, std::vector<ImuSample>& out_samples, std::string* error_out = nullptr) const;
+
+    void SetVerbose(bool verbose) const { verbose_ = verbose; }
+
+    const ExtraMetadataState& GetMetadataState() const { return metadata_state_; }
+
+private:
+    struct ImuCalibration {
+        bool have_ranges{false};
+        bool is_raw_gyro{false};
+        double gyro_range{2000.0};  // deg/s
+        double acc_range{16.0};     // g
     };
 
     mutable ImuCalibration imu_calib_{};
