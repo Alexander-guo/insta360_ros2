@@ -49,6 +49,7 @@ private:
         std::string model;
         bool have_first_frame_timestamp{false};
         double first_frame_timestamp{0.0};
+        double first_frame_timestamp_sec{0.0};
         bool have_gyro_timestamp{false};
         double gyro_timestamp_ms{0.0};
         bool have_frame_readout_time{false};

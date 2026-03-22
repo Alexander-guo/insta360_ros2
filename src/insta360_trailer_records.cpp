@@ -280,6 +280,7 @@ bool TrailerParser::ParseMetadataRecord(const uint8_t* data, size_t len) const {
     metadata_state_.model = camera_type;
     metadata_state_.have_first_frame_timestamp = have_first_frame_timestamp;
     metadata_state_.first_frame_timestamp = first_frame_timestamp;
+    metadata_state_.first_frame_timestamp_sec = is_raw_gyro ? (first_frame_timestamp * 1e-6) : (first_frame_timestamp * 1e-3);
     metadata_state_.have_gyro_timestamp = have_gyro_timestamp;
     metadata_state_.gyro_timestamp_ms = gyro_timestamp_ms;
     metadata_state_.have_frame_readout_time = have_frame_readout_time;
@@ -289,7 +290,7 @@ bool TrailerParser::ParseMetadataRecord(const uint8_t* data, size_t len) const {
     if (DumpRecordsEnabled(verbose_)) {
         std::printf(
             "MetadataState: model='%s' is_raw_gyro=%d acc_range=%.6f gyro_range=%.6f "
-            "have_first_frame_timestamp=%d first_frame_timestamp=%.6f "
+            "have_first_frame_timestamp=%d first_frame_timestamp_sec=%.6f "
             "have_gyro_timestamp=%d gyro_timestamp_ms=%.6f "
             "have_frame_readout_time=%d frame_readout_time=%.9f has_offset_v3=%d\n",
             metadata_state_.model.c_str(),
@@ -297,7 +298,7 @@ bool TrailerParser::ParseMetadataRecord(const uint8_t* data, size_t len) const {
             imu_calib_.acc_range,
             imu_calib_.gyro_range,
             metadata_state_.have_first_frame_timestamp ? 1 : 0,
-            metadata_state_.first_frame_timestamp,
+            metadata_state_.first_frame_timestamp_sec,
             metadata_state_.have_gyro_timestamp ? 1 : 0,
             metadata_state_.gyro_timestamp_ms,
             metadata_state_.have_frame_readout_time ? 1 : 0,
