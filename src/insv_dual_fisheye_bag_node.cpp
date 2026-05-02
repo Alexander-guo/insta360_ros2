@@ -132,6 +132,7 @@ public:
         declare_parameter<std::string>("image_transport_format", "jpeg");
         declare_parameter<std::string>("storage_id", "db3");
         declare_parameter<double>("time_window_margin_sec", 0.05);
+        declare_parameter<double>("global_ts_offset", 1e4);
         declare_parameter<double>("crop_ratio", 0.0);
         declare_parameter<int>("jpeg_quality", 90);
         declare_parameter<bool>("save_images", true);
@@ -154,6 +155,7 @@ public:
         image_transport_format_ = get_parameter("image_transport_format").as_string();
         storage_id_param_ = get_parameter("storage_id").as_string();
         time_window_margin_sec_ = get_parameter("time_window_margin_sec").as_double(); 
+        global_time_offset_sec_ = get_parameter("global_ts_offset").as_double();
         crop_ratio_ = get_parameter("crop_ratio").as_double();
         save_images_ = get_parameter("save_images").as_bool();
         verbose_ = get_parameter("verbose").as_bool();
@@ -181,6 +183,10 @@ public:
         if (!std::isfinite(crop_ratio_)) {
             RCLCPP_WARN(get_logger(), "crop_ratio is non-finite; disabling cropping");
             crop_ratio_ = 0.0;
+        }
+        if (!std::isfinite(global_time_offset_sec_)) {
+            RCLCPP_WARN(get_logger(), "global_time_offset is non-finite; using default 10000.0 sec");
+            global_time_offset_sec_ = 1e4;
         }
         crop_enabled_ = (crop_ratio_ > 0.0 && crop_ratio_ < 1.0);
         if (crop_enabled_) {

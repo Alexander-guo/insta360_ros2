@@ -17,6 +17,7 @@ def generate_launch_description():
     image_transport_format = LaunchConfiguration("image_transport_format")
     storage_id = LaunchConfiguration("storage_id")
     time_window_margin_sec = LaunchConfiguration("time_window_margin_sec")
+    global_ts_offset = LaunchConfiguration("global_ts_offset")
     jpeg_quality = LaunchConfiguration("jpeg_quality")
     encoding_threads = LaunchConfiguration("encoding_threads")
     decoder_threads = LaunchConfiguration("decoder_threads")
@@ -84,6 +85,12 @@ def generate_launch_description():
             description="IMU Margin for time window (seconds)"
         ),
         DeclareLaunchArgument(
+            "global_ts_offset",
+            default_value="10000.0",
+            description="Global timestamp offset in seconds, the timestamps of the first message will be shifted to start from this offset; \
+                useful to avoid issues with rosbag2 when timestamps are too close to zero"
+        ),
+        DeclareLaunchArgument(
             "jpeg_quality",
             default_value="50",
             description="JPEG encoding quality (1-100). Ignored if image_transport_format is 'png'"
@@ -132,6 +139,7 @@ def generate_launch_description():
                 "image_transport_format": image_transport_format,
                 "storage_id": storage_id,
                 "time_window_margin_sec": time_window_margin_sec,
+                "global_ts_offset": global_ts_offset,
                 "jpeg_quality": jpeg_quality,
                 "encoding_threads": encoding_threads,
                 "decoder_threads": decoder_threads,

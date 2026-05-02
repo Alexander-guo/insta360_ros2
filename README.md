@@ -87,6 +87,7 @@ The [launch file](launch/insv_dual_fisheye_bag.launch.py) exposes the following 
 - `compressed_images` (default `true`) – When true, the node only writes `sensor_msgs/CompressedImage` under `<topic>/compressed` instead of raw images.
 - `image_transport_format` (default `jpeg`) – Encoding format for compressed images; switch to `png` for lossless storage.
 - `storage_id` (default `db3`) – rosbag2 storage backend (`db3` for SQLite, `mcap` for MCAP).
+- `global_ts_offset` (default `10000.0`) – Global timestamp offset in seconds added when writing both IMU and image messages to the bag. The first bag messages will start near this offset instead of near `0`.
 - `jpeg_quality` (default `50`) – Quality level (1–100) for `JPEG` encoding; ignored when `image_transport_format` is `png`.
 - `encoding_threads` (default `0`) – Number of worker threads used for image compression (`0` use all the cpu cores).
 - `decoder_threads` (default `0`) – Number of FFmpeg threads dedicated to video decoding (`0` use all the cpu cores).
