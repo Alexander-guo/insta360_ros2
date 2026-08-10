@@ -40,8 +40,6 @@ struct EncodedFrameResult {
     rclcpp::Time stamp;
     std::shared_ptr<const rclcpp::SerializedMessage> rear_msg;
     std::shared_ptr<const rclcpp::SerializedMessage> front_msg;
-    std::shared_ptr<const rclcpp::SerializedMessage> rear_cropped_msg;
-    std::shared_ptr<const rclcpp::SerializedMessage> front_cropped_msg;
 };
 
 class FrameTaskPool {
@@ -130,7 +128,8 @@ public:
         declare_parameter<std::string>("imu_frame_id", "imu_frame");
         declare_parameter<bool>("compressed_images", true);
         declare_parameter<std::string>("image_transport_format", "jpeg");
-        declare_parameter<std::string>("storage_id", "db3");
+        declare_parameter<std::string>("storage_id", "mcap");
+        declare_parameter<std::string>("mcap_compression", "zstd_fast");
         declare_parameter<double>("time_window_margin_sec", 0.05);
         declare_parameter<double>("global_ts_offset", 1e4);
         declare_parameter<double>("crop_ratio", 0.0);
@@ -154,6 +153,7 @@ public:
         compressed_images_ = get_parameter("compressed_images").as_bool();
         image_transport_format_ = get_parameter("image_transport_format").as_string();
         storage_id_param_ = get_parameter("storage_id").as_string();
+        mcap_compression_ = get_parameter("mcap_compression").as_string();
         time_window_margin_sec_ = get_parameter("time_window_margin_sec").as_double(); 
         global_time_offset_sec_ = get_parameter("global_ts_offset").as_double();
         crop_ratio_ = get_parameter("crop_ratio").as_double();
@@ -190,10 +190,9 @@ public:
         }
         crop_enabled_ = (crop_ratio_ > 0.0 && crop_ratio_ < 1.0);
         if (crop_enabled_) {
-            const std::string crop_suffix = compressed_images_ ? "/cropped/compressed" : "/cropped";
-            front_cropped_topic_ = front_topic_ + crop_suffix;
-            rear_cropped_topic_ = rear_topic_ + crop_suffix;
-            RCLCPP_INFO(get_logger(), "Cropping enabled with ratio %.3f", crop_ratio_);
+            RCLCPP_INFO(get_logger(),
+                "Cropping enabled with ratio %.3f; cropped images will replace originals on the image topics",
+                crop_ratio_);
         } else if (crop_ratio_ < 0.0 || crop_ratio_ > 1.0) {
             RCLCPP_WARN(get_logger(), "crop_ratio %.3f outside (0,1); cropping disabled", crop_ratio_);
             crop_ratio_ = 0.0;
@@ -212,6 +211,23 @@ public:
         } else {
             RCLCPP_WARN(get_logger(), "Unknown storage_id '%s', defaulting to sqlite3", storage_id_param_.c_str());
             storage_id_param_ = "sqlite3";
+        }
+
+        std::transform(
+            mcap_compression_.begin(), mcap_compression_.end(), mcap_compression_.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mcap_compression_ != "none" &&
+            mcap_compression_ != "zstd_fast" &&
+            mcap_compression_ != "zstd_small") {
+            RCLCPP_WARN(get_logger(),
+                "Unknown mcap_compression '%s'; using zstd_fast",
+                mcap_compression_.c_str());
+            mcap_compression_ = "zstd_fast";
+        }
+        if (storage_id_param_ != "mcap" && mcap_compression_ != "none") {
+            RCLCPP_WARN(get_logger(),
+                "mcap_compression is ignored because storage_id is '%s'",
+                storage_id_param_.c_str());
         }
 
         if (!InitBagWriter()) {
@@ -244,6 +260,10 @@ private:
             rosbag2_storage::StorageOptions storage_options;
             storage_options.uri = bag_path_;
             storage_options.storage_id = storage_id_param_;
+            if (storage_id_param_ == "mcap") {
+                storage_options.storage_preset_profile = mcap_compression_;
+                RCLCPP_INFO(get_logger(), "MCAP compression profile: %s", mcap_compression_.c_str());
+            }
 
             rosbag2_cpp::ConverterOptions converter_options;
             converter_options.input_serialization_format = rmw_get_serialization_format();
@@ -265,19 +285,6 @@ private:
                 meta_rear.serialization_format = rmw_get_serialization_format();
                 writer_.create_topic(meta_rear);
 
-                if (crop_enabled_) {
-                    rosbag2_storage::TopicMetadata meta_front_cropped;
-                    meta_front_cropped.name = front_cropped_topic_;
-                    meta_front_cropped.type = "sensor_msgs/msg/CompressedImage";
-                    meta_front_cropped.serialization_format = rmw_get_serialization_format();
-                    writer_.create_topic(meta_front_cropped);
-
-                    rosbag2_storage::TopicMetadata meta_rear_cropped;
-                    meta_rear_cropped.name = rear_cropped_topic_;
-                    meta_rear_cropped.type = "sensor_msgs/msg/CompressedImage";
-                    meta_rear_cropped.serialization_format = rmw_get_serialization_format();
-                    writer_.create_topic(meta_rear_cropped);
-                }
             } else {
                 rosbag2_storage::TopicMetadata meta_front;
                 meta_front.name = front_topic_;
@@ -291,19 +298,6 @@ private:
                 meta_rear.serialization_format = rmw_get_serialization_format();
                 writer_.create_topic(meta_rear);
 
-                if (crop_enabled_) {
-                    rosbag2_storage::TopicMetadata meta_front_cropped;
-                    meta_front_cropped.name = front_cropped_topic_;
-                    meta_front_cropped.type = "sensor_msgs/msg/Image";
-                    meta_front_cropped.serialization_format = rmw_get_serialization_format();
-                    writer_.create_topic(meta_front_cropped);
-
-                    rosbag2_storage::TopicMetadata meta_rear_cropped;
-                    meta_rear_cropped.name = rear_cropped_topic_;
-                    meta_rear_cropped.type = "sensor_msgs/msg/Image";
-                    meta_rear_cropped.serialization_format = rmw_get_serialization_format();
-                    writer_.create_topic(meta_rear_cropped);
-                }
             }
 
             rosbag2_storage::TopicMetadata meta_imu;
@@ -528,9 +522,6 @@ private:
 
         const std::string rear_topic_to_write = compressed_images_ ? rear_topic_ + "/compressed" : rear_topic_;
         const std::string front_topic_to_write = compressed_images_ ? front_topic_ + "/compressed" : front_topic_;
-        const bool crop_enabled = crop_enabled_;
-        const std::string rear_cropped_topic_to_write = crop_enabled ? rear_cropped_topic_ : std::string();
-        const std::string front_cropped_topic_to_write = crop_enabled ? front_cropped_topic_ : std::string();
         const std::string msg_type = compressed_images_ ? "sensor_msgs/msg/CompressedImage" : "sensor_msgs/msg/Image";
 
         FrameTaskPool pool(static_cast<size_t>(encoding_threads_));
@@ -578,10 +569,6 @@ private:
                 if (result.valid) {
                     write_serialized(result.rear_msg, rear_topic_to_write, result.stamp);
                     write_serialized(result.front_msg, front_topic_to_write, result.stamp);
-                    if (crop_enabled) {
-                        write_serialized(result.rear_cropped_msg, rear_cropped_topic_to_write, result.stamp);
-                        write_serialized(result.front_cropped_msg, front_cropped_topic_to_write, result.stamp);
-                    }
                     ++frames_written;
                 } else {
                     ++skipped_frames;
@@ -672,32 +659,18 @@ private:
                         return image(cv::Rect(x, y, edge, edge));
                     };
 
+                    const cv::Mat rear_image = crop_enabled ? center_crop(frame.rear) : frame.rear;
+                    const cv::Mat front_image = crop_enabled ? center_crop(frame.front) : frame.front;
+                    if (rear_image.empty() || front_image.empty()) {
+                        return result;
+                    }
+
                     if (compressed) {
-                        result.rear_msg = encode_compressed(frame.rear, frame_id_rear);
-                        result.front_msg = encode_compressed(frame.front, frame_id_front);
-                        if (crop_enabled) {
-                            const cv::Mat rear_cropped = center_crop(frame.rear);
-                            if (!rear_cropped.empty()) {
-                                result.rear_cropped_msg = encode_compressed(rear_cropped, frame_id_rear);
-                            }
-                            const cv::Mat front_cropped = center_crop(frame.front);
-                            if (!front_cropped.empty()) {
-                                result.front_cropped_msg = encode_compressed(front_cropped, frame_id_front);
-                            }
-                        }
+                        result.rear_msg = encode_compressed(rear_image, frame_id_rear);
+                        result.front_msg = encode_compressed(front_image, frame_id_front);
                     } else {
-                        result.rear_msg = encode_raw(frame.rear, frame_id_rear);
-                        result.front_msg = encode_raw(frame.front, frame_id_front);
-                        if (crop_enabled) {
-                            const cv::Mat rear_cropped = center_crop(frame.rear);
-                            if (!rear_cropped.empty()) {
-                                result.rear_cropped_msg = encode_raw(rear_cropped, frame_id_rear);
-                            }
-                            const cv::Mat front_cropped = center_crop(frame.front);
-                            if (!front_cropped.empty()) {
-                                result.front_cropped_msg = encode_raw(front_cropped, frame_id_front);
-                            }
-                        }
+                        result.rear_msg = encode_raw(rear_image, frame_id_rear);
+                        result.front_msg = encode_raw(front_image, frame_id_front);
                     }
                     result.valid = (result.rear_msg && result.front_msg);
                     return result;
@@ -763,6 +736,7 @@ private:
     bool compressed_images_{false};
     std::string image_transport_format_ = "jpeg";
     std::string storage_id_param_ = "sqlite3";
+    std::string mcap_compression_ = "zstd_fast";
 
     // Alignment parameters
     double video_min_sec_{std::numeric_limits<double>::quiet_NaN()};
@@ -775,8 +749,6 @@ private:
     int encoding_threads_{1};
     int decoder_threads_{1};
     bool crop_enabled_{false};
-    std::string front_cropped_topic_;
-    std::string rear_cropped_topic_;
 
     rosbag2_cpp::Writer writer_;
 };

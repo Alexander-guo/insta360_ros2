@@ -16,6 +16,7 @@ def generate_launch_description():
     compressed_images = LaunchConfiguration("compressed_images")
     image_transport_format = LaunchConfiguration("image_transport_format")
     storage_id = LaunchConfiguration("storage_id")
+    mcap_compression = LaunchConfiguration("mcap_compression")
     time_window_margin_sec = LaunchConfiguration("time_window_margin_sec")
     global_ts_offset = LaunchConfiguration("global_ts_offset")
     jpeg_quality = LaunchConfiguration("jpeg_quality")
@@ -76,8 +77,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "storage_id",
-            default_value="db3",
+            default_value="mcap",
             description="Rosbag2 storage id: 'db3' (sqlite3) or 'mcap'"
+        ),
+        DeclareLaunchArgument(
+            "mcap_compression",
+            default_value="zstd_fast",
+            description="MCAP chunk compression profile: 'none', 'zstd_fast', or 'zstd_small'"
         ),
         DeclareLaunchArgument(
             "time_window_margin_sec",
@@ -107,8 +113,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "crop_ratio",
-            default_value="0.75",
-            description="Center crop ratio (0 or 1 = disabled, (0,1) crops square)"
+            default_value="1.0",
+            description="Center crop ratio: (0,1) writes only cropped images on the standard image topics; 0.0 or 1.0 writes originals"
         ),
         DeclareLaunchArgument(
             "save_images",
@@ -121,7 +127,7 @@ def generate_launch_description():
             description="If true, print verbose logs during trailer parsing, helpful for debugging or understanding the trailer structure"
         ),
         Node(
-            package="insta360_ros_driver",
+            package="insta360_ros",
             executable="insv_dual_fisheye_bag_node",
             name="insv_dual_fisheye_bag_node",
             output="screen",
@@ -138,6 +144,7 @@ def generate_launch_description():
                 "compressed_images": compressed_images,
                 "image_transport_format": image_transport_format,
                 "storage_id": storage_id,
+                "mcap_compression": mcap_compression,
                 "time_window_margin_sec": time_window_margin_sec,
                 "global_ts_offset": global_ts_offset,
                 "jpeg_quality": jpeg_quality,
