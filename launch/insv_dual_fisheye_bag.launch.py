@@ -2,6 +2,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -23,6 +24,7 @@ def generate_launch_description():
     encoding_threads = LaunchConfiguration("encoding_threads")
     decoder_threads = LaunchConfiguration("decoder_threads")
     crop_ratio = LaunchConfiguration("crop_ratio")
+    resize_size = LaunchConfiguration("resize_size")
     save_images = LaunchConfiguration("save_images")
     verbose = LaunchConfiguration("verbose")
 
@@ -117,6 +119,11 @@ def generate_launch_description():
             description="Center crop ratio: (0,1) writes only cropped images on the standard image topics; 0.0 or 1.0 writes originals"
         ),
         DeclareLaunchArgument(
+            "resize_size",
+            default_value="0",
+            description="Output image size: 0 keeps current size, k produces kxk, and k1,k2 produces width k1 x height k2"
+        ),
+        DeclareLaunchArgument(
             "save_images",
             default_value="true",
             description="If true, save images to the rosbag2; if false, only save IMU data (useful for debugging or when images are not needed)"
@@ -151,6 +158,7 @@ def generate_launch_description():
                 "encoding_threads": encoding_threads,
                 "decoder_threads": decoder_threads,
                 "crop_ratio": crop_ratio,
+                "resize_size": ParameterValue(resize_size, value_type=str),
                 "save_images": save_images,
             }]
         )

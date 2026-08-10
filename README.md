@@ -93,6 +93,7 @@ The [launch file](launch/insv_dual_fisheye_bag.launch.py) exposes the following 
 - `encoding_threads` (default `0`) – Number of worker threads used for image compression (`0` use all the cpu cores).
 - `decoder_threads` (default `0`) – Number of FFmpeg threads dedicated to video decoding (`0` use all the cpu cores).
 - `crop_ratio` (default `1.0`) – Center crop ratio (`0` or `1` writes original images; `(0,1)` writes only the cropped images on the standard image topics).
+- `resize_size` (default `0`) – Output image dimensions applied after cropping: `0` keeps the current size, `k` produces `k×k`, and `k1,k2` produces width `k1` × height `k2`, accepted formats are `k` or `k1,k2` (e.g. `640`, `"640,480"` or `640x480`).
 - `time_window_margin_sec` (default `0.05`) - Time padding (in seconds) added before the first and after the last video frame when filtering and validating IMU samples. If processing multiple videos, this margin is decided automatically based on the interval between video frames.
 - `save_images` (default `true`) - If true, save images to the rosbag2; if false, only save IMU data (useful for debugging or when images are not needed).
 

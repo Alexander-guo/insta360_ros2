@@ -133,6 +133,7 @@ public:
         declare_parameter<double>("time_window_margin_sec", 0.05);
         declare_parameter<double>("global_ts_offset", 1e4);
         declare_parameter<double>("crop_ratio", 0.0);
+        declare_parameter<std::string>("resize_size", "0");
         declare_parameter<int>("jpeg_quality", 90);
         declare_parameter<bool>("save_images", true);
         declare_parameter<bool>("verbose", false);
@@ -157,6 +158,7 @@ public:
         time_window_margin_sec_ = get_parameter("time_window_margin_sec").as_double(); 
         global_time_offset_sec_ = get_parameter("global_ts_offset").as_double();
         crop_ratio_ = get_parameter("crop_ratio").as_double();
+        const std::string resize_size_param = get_parameter("resize_size").as_string();
         save_images_ = get_parameter("save_images").as_bool();
         verbose_ = get_parameter("verbose").as_bool();
         {
@@ -188,6 +190,56 @@ public:
             RCLCPP_WARN(get_logger(), "global_time_offset is non-finite; using default 10000.0 sec");
             global_time_offset_sec_ = 1e4;
         }
+
+        {
+            std::string spec;
+            spec.reserve(resize_size_param.size());
+            for (const unsigned char c : resize_size_param) {
+                if (!std::isspace(c)) {
+                    spec.push_back(c == 'x' || c == 'X' ? ',' : static_cast<char>(c));
+                }
+            }
+
+            auto parse_dimension = [](const std::string& value, int& result) {
+                if (value.empty()) {
+                    return false;
+                }
+                try {
+                    size_t parsed = 0;
+                    const long long dimension = std::stoll(value, &parsed);
+                    if (parsed != value.size() || dimension <= 0 || dimension > std::numeric_limits<int>::max()) {
+                        return false;
+                    }
+                    result = static_cast<int>(dimension);
+                    return true;
+                } catch (const std::exception&) {
+                    return false;
+                }
+            };
+
+            if (spec != "0" && !spec.empty()) {
+                const size_t separator = spec.find(',');
+                bool valid = false;
+                if (separator == std::string::npos) {
+                    valid = parse_dimension(spec, resize_width_);
+                    resize_height_ = resize_width_;
+                } else if (spec.find(',', separator + 1) == std::string::npos) {
+                    valid = parse_dimension(spec.substr(0, separator), resize_width_) &&
+                        parse_dimension(spec.substr(separator + 1), resize_height_);
+                }
+                if (!valid) {
+                    RCLCPP_WARN(get_logger(),
+                        "Invalid resize_size '%s'; resizing disabled (use 0, k, or k1,k2)",
+                        resize_size_param.c_str());
+                    resize_width_ = 0;
+                    resize_height_ = 0;
+                }
+            }
+            if (resize_width_ > 0) {
+                RCLCPP_INFO(get_logger(), "Output image resize enabled: %dx%d", resize_width_, resize_height_);
+            }
+        }
+
         crop_enabled_ = (crop_ratio_ > 0.0 && crop_ratio_ < 1.0);
         if (crop_enabled_) {
             RCLCPP_INFO(get_logger(),
@@ -588,6 +640,8 @@ private:
                  frame_id_rear = frame_id_rear_,
                  crop_enabled = crop_enabled_,
                  crop_ratio = crop_ratio_,
+                 resize_width = resize_width_,
+                 resize_height = resize_height_,
                  video_frame_overlap_sec = video_frame_overlap_sec_,
                  global_offset = global_time_offset_sec_]() mutable {
                     EncodedFrameResult result;
@@ -659,10 +713,25 @@ private:
                         return image(cv::Rect(x, y, edge, edge));
                     };
 
-                    const cv::Mat rear_image = crop_enabled ? center_crop(frame.rear) : frame.rear;
-                    const cv::Mat front_image = crop_enabled ? center_crop(frame.front) : frame.front;
+                    cv::Mat rear_image = crop_enabled ? center_crop(frame.rear) : frame.rear;
+                    cv::Mat front_image = crop_enabled ? center_crop(frame.front) : frame.front;
                     if (rear_image.empty() || front_image.empty()) {
                         return result;
+                    }
+
+                    if (resize_width > 0 && resize_height > 0) {
+                        cv::Mat resized_rear;
+                        cv::Mat resized_front;
+                        const int rear_interpolation =
+                            resize_width < rear_image.cols || resize_height < rear_image.rows ?
+                            cv::INTER_AREA : cv::INTER_LINEAR;
+                        const int front_interpolation =
+                            resize_width < front_image.cols || resize_height < front_image.rows ?
+                            cv::INTER_AREA : cv::INTER_LINEAR;
+                        cv::resize(rear_image, resized_rear, cv::Size(resize_width, resize_height), 0.0, 0.0, rear_interpolation);
+                        cv::resize(front_image, resized_front, cv::Size(resize_width, resize_height), 0.0, 0.0, front_interpolation);
+                        rear_image = std::move(resized_rear);
+                        front_image = std::move(resized_front);
                     }
 
                     if (compressed) {
@@ -745,6 +814,8 @@ private:
     double frame_interval_sec_{0.001};
     double time_window_margin_sec_{0};
     double crop_ratio_{0.0};
+    int resize_width_{0};
+    int resize_height_{0};
     int jpeg_quality_{90};
     int encoding_threads_{1};
     int decoder_threads_{1};
