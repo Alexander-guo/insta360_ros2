@@ -2,6 +2,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -16,9 +17,16 @@ def generate_launch_description():
     compressed_images = LaunchConfiguration("compressed_images")
     image_transport_format = LaunchConfiguration("image_transport_format")
     storage_id = LaunchConfiguration("storage_id")
+    mcap_compression = LaunchConfiguration("mcap_compression")
+    time_window_margin_sec = LaunchConfiguration("time_window_margin_sec")
+    global_ts_offset = LaunchConfiguration("global_ts_offset")
     jpeg_quality = LaunchConfiguration("jpeg_quality")
     encoding_threads = LaunchConfiguration("encoding_threads")
     decoder_threads = LaunchConfiguration("decoder_threads")
+    crop_ratio = LaunchConfiguration("crop_ratio")
+    resize_size = LaunchConfiguration("resize_size")
+    save_images = LaunchConfiguration("save_images")
+    verbose = LaunchConfiguration("verbose")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -71,8 +79,24 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "storage_id",
-            default_value="db3",
+            default_value="mcap",
             description="Rosbag2 storage id: 'db3' (sqlite3) or 'mcap'"
+        ),
+        DeclareLaunchArgument(
+            "mcap_compression",
+            default_value="zstd_fast",
+            description="MCAP chunk compression profile: 'none', 'zstd_fast', or 'zstd_small'"
+        ),
+        DeclareLaunchArgument(
+            "time_window_margin_sec",
+            default_value="0.05",
+            description="IMU Margin for time window (seconds)"
+        ),
+        DeclareLaunchArgument(
+            "global_ts_offset",
+            default_value="10000.0",
+            description="Global timestamp offset in seconds, the timestamps of the first message will be shifted to start from this offset; \
+                useful to avoid issues with rosbag2 when timestamps are too close to zero"
         ),
         DeclareLaunchArgument(
             "jpeg_quality",
@@ -89,10 +113,31 @@ def generate_launch_description():
             default_value="0",
             description="FFmpeg decode threads for probing/streaming (0 = auto)"
         ),
+        DeclareLaunchArgument(
+            "crop_ratio",
+            default_value="1.0",
+            description="Center crop ratio: (0,1) writes only cropped images on the standard image topics; 0.0 or 1.0 writes originals"
+        ),
+        DeclareLaunchArgument(
+            "resize_size",
+            default_value="0",
+            description="Output image size: 0 keeps current size, k produces kxk, and k1,k2 produces width k1 x height k2"
+        ),
+        DeclareLaunchArgument(
+            "save_images",
+            default_value="true",
+            description="If true, save images to the rosbag2; if false, only save IMU data (useful for debugging or when images are not needed)"
+        ),
+        DeclareLaunchArgument(
+            "verbose",
+            default_value="false",
+            description="If true, print verbose logs during trailer parsing, helpful for debugging or understanding the trailer structure"
+        ),
         Node(
-            package="insta360_ros_driver",
+            package="insta360_ros",
             executable="insv_dual_fisheye_bag_node",
             name="insv_dual_fisheye_bag_node",
+            output="screen",
             parameters=[{
                 "file_path": file_path,
                 "bag_path": bag_path,
@@ -102,12 +147,19 @@ def generate_launch_description():
                 "frame_id_front": frame_id_front,
                 "frame_id_rear": frame_id_rear,
                 "imu_frame_id": imu_frame_id,
+                "verbose": verbose,
                 "compressed_images": compressed_images,
                 "image_transport_format": image_transport_format,
                 "storage_id": storage_id,
+                "mcap_compression": mcap_compression,
+                "time_window_margin_sec": time_window_margin_sec,
+                "global_ts_offset": global_ts_offset,
                 "jpeg_quality": jpeg_quality,
                 "encoding_threads": encoding_threads,
                 "decoder_threads": decoder_threads,
+                "crop_ratio": crop_ratio,
+                "resize_size": ParameterValue(resize_size, value_type=str),
+                "save_images": save_images,
             }]
         )
     ])

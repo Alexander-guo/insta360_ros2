@@ -81,9 +81,12 @@ void ConfigureDecoderThreads(AVCodecContext* ctx, int decode_threads) {
 
 } // namespace
 
-bool InsvVideoDecoder::probe_time_window(double& min_sec, double& max_sec, std::string* error_out) {
+bool InsvVideoDecoder::probe_time_window(double& min_sec, double& max_sec, std::size_t* frame_count, std::string* error_out) {
     min_sec = std::numeric_limits<double>::quiet_NaN();
     max_sec = std::numeric_limits<double>::quiet_NaN();
+    if (frame_count) {
+        *frame_count = 0;
+    }
 
     AVFormatContext* fmt_ctx = nullptr;
     if (avformat_open_input(&fmt_ctx, path_.c_str(), nullptr, nullptr) < 0) {
@@ -169,6 +172,7 @@ bool InsvVideoDecoder::probe_time_window(double& min_sec, double& max_sec, std::
         return false;
     }
     bool saw_frame = false;
+    std::size_t frames_seen = 0;
     double local_min = std::numeric_limits<double>::infinity();
     double local_max = -std::numeric_limits<double>::infinity();
 
@@ -192,6 +196,7 @@ bool InsvVideoDecoder::probe_time_window(double& min_sec, double& max_sec, std::
                     local_min = std::min(local_min, t);
                     local_max = std::max(local_max, t);
                 }
+                ++frames_seen;
             }
             av_frame_unref(frame);
         }
@@ -229,6 +234,18 @@ bool InsvVideoDecoder::probe_time_window(double& min_sec, double& max_sec, std::
     if (ok) {
         min_sec = local_min;
         max_sec = local_max;
+        if (frame_count) {
+            // Note: .lrv files typically expose a single video stream where each frame already
+            // contains both lenses side-by-side, while .insv files usually expose two separate
+            // video streams (one per lens). "frames_seen" counts all decoded frames across all
+            // video streams, so dividing by probes.size() normalizes this to an approximate
+            // number of logical frame pairs (front+rear) that is comparable between .lrv and
+            // .insv inputs.
+            *frame_count = frames_seen / probes.size(); // approximate count of front+rear frame pairs
+
+            // printf("Probe found %zu frames across %zu streams\n, frame_count: %zu", frames_seen, probes.size(), *frame_count);
+            // fflush(stdout);
+        }
     }
 
     av_packet_free(&pkt);
@@ -387,6 +404,7 @@ bool InsvVideoDecoder::stream_decode(const std::function<bool(DecodedFrame&&)>& 
             return true;
         }
         if (streams.size() == 1) {
+            // Single stream case (e.g. .lrv input): each frame contains both front and rear side-by-side
             auto& queue = streams[0].ready_frames;
             while (!queue.empty()) {
                 RawFrame raw = std::move(queue.front());
@@ -405,6 +423,8 @@ bool InsvVideoDecoder::stream_decode(const std::function<bool(DecodedFrame&&)>& 
                 }
             }
         } else {
+            // Dual stream case (e.g. .insv input): need to pair frames from front and rear streams based on availability; 
+            // we use the min timestamp of the pair as the output timestamp
             auto& front_q = streams[0].ready_frames;
             auto& rear_q = streams[1].ready_frames;
             while (!front_q.empty() && !rear_q.empty()) {

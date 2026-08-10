@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5)
-project(insta360_ros_driver)
+project(insta360_ros)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -33,7 +33,11 @@ include_directories(
   ${SWSCALE_INCLUDE_DIRS}
 )
 
-add_library(insta360_trailer_parser src/insta360_trailer_parser.cpp)
+add_library(insta360_trailer_parser
+  src/insta360_trailer_parser.cpp
+  src/insta360_trailer_records.cpp
+  src/insta360_extra_info.cpp
+)
 
 add_library(insv_video_decoder src/insv_video_decoder.cpp)
 target_link_libraries(insv_video_decoder
@@ -131,6 +135,13 @@ target_link_libraries(insv_dual_fisheye_bag_node
 )
 
 install(TARGETS insv_dual_fisheye_bag_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+add_executable(trailer_parser_dump src/trailer_parser_dump.cpp)
+target_link_libraries(trailer_parser_dump insta360_trailer_parser)
+
+install(TARGETS trailer_parser_dump
   DESTINATION lib/${PROJECT_NAME}
 )
 

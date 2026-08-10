@@ -3,13 +3,17 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 #include <rclcpp/rclcpp.hpp>
@@ -124,16 +128,22 @@ public:
         declare_parameter<std::string>("imu_frame_id", "imu_frame");
         declare_parameter<bool>("compressed_images", true);
         declare_parameter<std::string>("image_transport_format", "jpeg");
-        declare_parameter<std::string>("storage_id", "db3");
+        declare_parameter<std::string>("storage_id", "mcap");
+        declare_parameter<std::string>("mcap_compression", "zstd_fast");
         declare_parameter<double>("time_window_margin_sec", 0.05);
+        declare_parameter<double>("global_ts_offset", 1e4);
+        declare_parameter<double>("crop_ratio", 0.0);
+        declare_parameter<std::string>("resize_size", "0");
         declare_parameter<int>("jpeg_quality", 90);
+        declare_parameter<bool>("save_images", true);
+        declare_parameter<bool>("verbose", false);
         const unsigned int hw_threads = std::thread::hardware_concurrency();
         const int default_threads = hw_threads > 0 ? static_cast<int>(hw_threads) : 4;
         const int decoder_default_threads = hw_threads > 0 ? std::min(default_threads, 16) : 4;
         declare_parameter<int>("encoding_threads", default_threads);
         declare_parameter<int>("decoder_threads", decoder_default_threads);
 
-        file_path_ = get_parameter("file_path").as_string();
+        const std::string file_path_param = get_parameter("file_path").as_string();
         bag_path_ = get_parameter("bag_path").as_string();
         front_topic_ = get_parameter("front_topic").as_string();
         rear_topic_ = get_parameter("rear_topic").as_string();
@@ -144,7 +154,13 @@ public:
         compressed_images_ = get_parameter("compressed_images").as_bool();
         image_transport_format_ = get_parameter("image_transport_format").as_string();
         storage_id_param_ = get_parameter("storage_id").as_string();
-        time_window_margin_sec_ = get_parameter("time_window_margin_sec").as_double();
+        mcap_compression_ = get_parameter("mcap_compression").as_string();
+        time_window_margin_sec_ = get_parameter("time_window_margin_sec").as_double(); 
+        global_time_offset_sec_ = get_parameter("global_ts_offset").as_double();
+        crop_ratio_ = get_parameter("crop_ratio").as_double();
+        const std::string resize_size_param = get_parameter("resize_size").as_string();
+        save_images_ = get_parameter("save_images").as_bool();
+        verbose_ = get_parameter("verbose").as_bool();
         {
             int q = get_parameter("jpeg_quality").as_int();
             if (q < 1) q = 1;
@@ -166,6 +182,79 @@ public:
             }
         }
 
+        if (!std::isfinite(crop_ratio_)) {
+            RCLCPP_WARN(get_logger(), "crop_ratio is non-finite; disabling cropping");
+            crop_ratio_ = 0.0;
+        }
+        if (!std::isfinite(global_time_offset_sec_)) {
+            RCLCPP_WARN(get_logger(), "global_time_offset is non-finite; using default 10000.0 sec");
+            global_time_offset_sec_ = 1e4;
+        }
+
+        {
+            std::string spec;
+            spec.reserve(resize_size_param.size());
+            for (const unsigned char c : resize_size_param) {
+                if (!std::isspace(c)) {
+                    spec.push_back(c == 'x' || c == 'X' ? ',' : static_cast<char>(c));
+                }
+            }
+
+            auto parse_dimension = [](const std::string& value, int& result) {
+                if (value.empty()) {
+                    return false;
+                }
+                try {
+                    size_t parsed = 0;
+                    const long long dimension = std::stoll(value, &parsed);
+                    if (parsed != value.size() || dimension <= 0 || dimension > std::numeric_limits<int>::max()) {
+                        return false;
+                    }
+                    result = static_cast<int>(dimension);
+                    return true;
+                } catch (const std::exception&) {
+                    return false;
+                }
+            };
+
+            if (spec != "0" && !spec.empty()) {
+                const size_t separator = spec.find(',');
+                bool valid = false;
+                if (separator == std::string::npos) {
+                    valid = parse_dimension(spec, resize_width_);
+                    resize_height_ = resize_width_;
+                } else if (spec.find(',', separator + 1) == std::string::npos) {
+                    valid = parse_dimension(spec.substr(0, separator), resize_width_) &&
+                        parse_dimension(spec.substr(separator + 1), resize_height_);
+                }
+                if (!valid) {
+                    RCLCPP_WARN(get_logger(),
+                        "Invalid resize_size '%s'; resizing disabled (use 0, k, or k1,k2)",
+                        resize_size_param.c_str());
+                    resize_width_ = 0;
+                    resize_height_ = 0;
+                }
+            }
+            if (resize_width_ > 0) {
+                RCLCPP_INFO(get_logger(), "Output image resize enabled: %dx%d", resize_width_, resize_height_);
+            }
+        }
+
+        crop_enabled_ = (crop_ratio_ > 0.0 && crop_ratio_ < 1.0);
+        if (crop_enabled_) {
+            RCLCPP_INFO(get_logger(),
+                "Cropping enabled with ratio %.3f; cropped images will replace originals on the image topics",
+                crop_ratio_);
+        } else if (crop_ratio_ < 0.0 || crop_ratio_ > 1.0) {
+            RCLCPP_WARN(get_logger(), "crop_ratio %.3f outside (0,1); cropping disabled", crop_ratio_);
+            crop_ratio_ = 0.0;
+        }
+
+        if (bag_path_.empty()) {
+            RCLCPP_ERROR(get_logger(), "Parameter 'bag_path' is required");
+            return;
+        }
+
         // Map user-friendly values to rosbag2 storage IDs
         if (storage_id_param_ == "db3" || storage_id_param_ == "sqlite" || storage_id_param_ == "sqlite3") {
             storage_id_param_ = "sqlite3";
@@ -176,9 +265,21 @@ public:
             storage_id_param_ = "sqlite3";
         }
 
-        if (file_path_.empty() || bag_path_.empty()) {
-            RCLCPP_ERROR(get_logger(), "Parameters 'file_path' and 'bag_path' are required");
-            return;
+        std::transform(
+            mcap_compression_.begin(), mcap_compression_.end(), mcap_compression_.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mcap_compression_ != "none" &&
+            mcap_compression_ != "zstd_fast" &&
+            mcap_compression_ != "zstd_small") {
+            RCLCPP_WARN(get_logger(),
+                "Unknown mcap_compression '%s'; using zstd_fast",
+                mcap_compression_.c_str());
+            mcap_compression_ = "zstd_fast";
+        }
+        if (storage_id_param_ != "mcap" && mcap_compression_ != "none") {
+            RCLCPP_WARN(get_logger(),
+                "mcap_compression is ignored because storage_id is '%s'",
+                storage_id_param_.c_str());
         }
 
         if (!InitBagWriter()) {
@@ -186,199 +287,23 @@ public:
             return;
         }
 
-        // Parse trailer IMU and VideoTimeStamp
-        insta360_insv::TrailerParser parser;
-        std::vector<insta360_insv::ImuSample> trailer_samples;
-        std::string err;
-        if (!parser.ParseFile(file_path_, trailer_samples, &err)) {
-            RCLCPP_ERROR(get_logger(), "Failed to parse trailer: %s", err.c_str());
+        if (!LoadFilePaths(file_path_param)) {
+            RCLCPP_ERROR(get_logger(), "Parameter 'file_path' must be a valid file or directory containing .insv/.lrv files");
             return;
         }
-        for (const auto& s : trailer_samples) {
-            if (s.is_video_ts) {
-                video_ts_raw_.push_back(s.raw_time);
-            } else {
-                imu_samples_.push_back(s);
-            }
-        }
-        // Stats on IMU record encoding
-        if (!imu_samples_.empty()) {
-            size_t hp = 0, sp = 0;
-            for (const auto& s : imu_samples_) {
-                if (s.high_precision) hp++; else sp++;
-            }
-            RCLCPP_INFO(get_logger(), "IMU records parsed: %zu total (double=%zu, short=%zu)", imu_samples_.size(), hp, sp);
-        }
-        if (!video_ts_raw_.empty()) {
-            std::sort(video_ts_raw_.begin(), video_ts_raw_.end());
-            video_ts_raw_.erase(std::unique(video_ts_raw_.begin(), video_ts_raw_.end()), video_ts_raw_.end());
-        }
-        if (!imu_samples_.empty()) {
-            std::sort(imu_samples_.begin(), imu_samples_.end(), [](const insta360_insv::ImuSample& lhs, const insta360_insv::ImuSample& rhs) {
-                return lhs.raw_time < rhs.raw_time;
-            });
-        }
-        if (video_ts_raw_.empty()) {
-            RCLCPP_WARN(get_logger(), "No video timestamps (0x600) found; alignment will use zero offset");
+        
+        if (file_paths_.size() > 1) {
+            multi_files_ = true;
+            time_window_margin_sec_ = 0.0;
+            RCLCPP_INFO(get_logger(), "Found %zu files to process", file_paths_.size());
         }
 
-        // Probe video timestamps first to derive a reliable window without buffering frames
-        {
-            insta360_insv::InsvVideoDecoder decoder(file_path_, decoder_threads_);
-            std::string derr;
-            if (!decoder.open(&derr)) {
-                RCLCPP_ERROR(get_logger(), "Decoder open failed: %s", derr.c_str());
-                return;
+        for (const auto& path : file_paths_) {
+            RCLCPP_INFO(get_logger(), "\nProcessing file: %s", path.c_str());
+            if (!ProcessFile(path)) {
+                RCLCPP_ERROR(get_logger(), "Failed to process file: %s", path.c_str());
             }
-
-            double vmin = 0.0;
-            double vmax = 0.0;
-            if (!decoder.probe_time_window(vmin, vmax, &derr)) {
-                RCLCPP_ERROR(get_logger(), "Failed to probe video timestamps: %s", derr.c_str());
-                return;
-            }
-
-            if (!std::isfinite(vmin) || !std::isfinite(vmax)) {
-                RCLCPP_ERROR(get_logger(), "Video timestamps are not finite (min=%.3f max=%.3f)", vmin, vmax);
-                return;
-            }
-
-            video_min_sec_ = vmin;
-            video_max_sec_ = vmax;
-            video_dur_sec_ = std::max(0.0, video_max_sec_ - video_min_sec_);
         }
-
-        // Align IMU raw timestamps to video timestamps with robust filtering.
-        if (!imu_samples_.empty()) {
-            // Use video window from decoded frames
-            const double video_start_sec = video_min_sec_;
-            const double video_dur = video_dur_sec_;
-            // Build a list of plausible raw times to infer scale (reject extremes poisoning span)
-            std::vector<double> valid_raw;
-            valid_raw.reserve(imu_samples_.size());
-            for (const auto& s : imu_samples_) {
-                if (std::isfinite(s.raw_time) && s.raw_time > 0.0 && s.raw_time < 1e12) {
-                    valid_raw.push_back(s.raw_time);
-                }
-            }
-            double min_raw = imu_samples_.front().raw_time;
-            double max_raw = imu_samples_.front().raw_time;
-            if (!valid_raw.empty()) {
-                auto [mn_it, mx_it] = std::minmax_element(valid_raw.begin(), valid_raw.end());
-                min_raw = *mn_it;
-                max_raw = *mx_it;
-            } else {
-                for (const auto& s : imu_samples_) {
-                    if (s.raw_time < min_raw) min_raw = s.raw_time;
-                    if (s.raw_time > max_raw) max_raw = s.raw_time;
-                }
-            }
-            const double span = max_raw - min_raw;
-            // Detect IMU scale from its own span only (µs vs ms)
-            imu_time_scale_ = (span > 1e6 ? 1e-6 : 1e-3);
-
-            // Estimate offset to anchor IMU start to video start (first valid IMU)
-            imu_time_offset_ = 0.0;
-            if (std::isfinite(video_start_sec)) {
-                double imu_ref = std::numeric_limits<double>::quiet_NaN();
-                for (const auto& s : imu_samples_) {
-                    if (s.raw_time > 0.0 && s.raw_time < 1e16) { // sanity
-                        imu_ref = s.raw_time * imu_time_scale_;
-                        break;
-                    }
-                }
-                if (std::isfinite(imu_ref)) {
-                    imu_time_offset_ = video_start_sec - imu_ref;
-                }
-            }
-
-            // Filter by duration bound and monotonicity on raw_time; then compute aligned time
-            const double video_min = std::isfinite(video_start_sec) ? video_start_sec : std::numeric_limits<double>::quiet_NaN();
-            const double video_max = (std::isfinite(video_start_sec) && std::isfinite(video_dur)) ? (video_start_sec + video_dur) : std::numeric_limits<double>::quiet_NaN();
-            // Keep existing member window (already set from frames)
-
-            std::vector<insta360_insv::ImuSample> cleaned;
-            cleaned.reserve(imu_samples_.size());
-            size_t dropped_ts_range = 0;
-            size_t dropped_non_mono = 0;
-            double last_raw = -1.0;
-            for (const auto& s : imu_samples_) {
-                const double rt = s.raw_time;
-                if (!(rt > 0.0 && std::isfinite(rt))) {
-                    ++dropped_ts_range;
-                    continue;
-                }
-                if (rt < min_raw || rt > max_raw) {
-                    ++dropped_ts_range;
-                    continue;
-                }
-                // Use aligned IMU time against absolute video window
-                if (std::isfinite(video_min) && std::isfinite(video_max)) {
-                    const double sec_aligned = rt * imu_time_scale_ + imu_time_offset_;
-                    if (!(sec_aligned >= video_min - time_window_margin_sec_ && sec_aligned <= video_max + time_window_margin_sec_)) {
-                        ++dropped_ts_range;
-                        continue;
-                    }
-                }
-                if (last_raw >= 0.0 && rt <= last_raw) {
-                    ++dropped_non_mono;
-                    continue;
-                }
-                last_raw = rt;
-                cleaned.push_back(s);
-            }
-
-            if (!cleaned.empty()) {
-                imu_samples_.swap(cleaned);
-            }
-
-            for (auto& s : imu_samples_) {
-                s.time_sec = s.raw_time * imu_time_scale_ + imu_time_offset_;
-            }
-
-            // Drop IMU samples that still fall outside the computed video window after alignment
-            size_t dropped_beyond_window = 0;
-            if (std::isfinite(video_min) && std::isfinite(video_max)) {
-                std::vector<insta360_insv::ImuSample> windowed;
-                windowed.reserve(imu_samples_.size());
-                for (const auto& s : imu_samples_) {
-                    if (s.time_sec < video_min - time_window_margin_sec_ || s.time_sec > video_max + time_window_margin_sec_) {
-                        ++dropped_beyond_window;
-                        continue;
-                    }
-                    windowed.push_back(s);
-                }
-                if (!windowed.empty()) {
-                    imu_samples_.swap(windowed);
-                }
-            }
-
-            RCLCPP_INFO(get_logger(),
-                        "IMU time alignment: raw_min=%.3f raw_max=%.3f span=%.3f scale=%.6g offset=%.6f video_start=%.6f video_dur=%.3f dropped_range=%zu dropped_nonmono=%zu dropped_outside=%zu kept=%zu",
-                        min_raw, max_raw, span, imu_time_scale_, imu_time_offset_,
-                        video_min, std::isfinite(video_dur) ? video_dur : -1.0, dropped_ts_range, dropped_non_mono, dropped_beyond_window, imu_samples_.size());
-        }
-
-        if (!imu_samples_.empty()) {
-            double imu_min = imu_samples_.front().time_sec;
-            double imu_max = imu_samples_.back().time_sec;
-
-            RCLCPP_WARN(
-                get_logger(),
-                "FINAL WINDOW: video [%.3f, %.3f], imu [%.3f, %.3f]",
-                video_min_sec_, video_max_sec_, imu_min, imu_max);
-        } else {
-            RCLCPP_WARN(
-                get_logger(),
-                "FINAL WINDOW: video [%.3f, %.3f], imu [no samples remain after filtering]",
-                video_min_sec_, video_max_sec_);
-        }
-
-        // Write IMU samples first (now clamped to the video window)
-        WriteImuSamples();
-
-        // Write dual fisheye frames (reuse decoded frames)
-        DecodeAndWriteVideo();
     }
 
 private:
@@ -387,6 +312,10 @@ private:
             rosbag2_storage::StorageOptions storage_options;
             storage_options.uri = bag_path_;
             storage_options.storage_id = storage_id_param_;
+            if (storage_id_param_ == "mcap") {
+                storage_options.storage_preset_profile = mcap_compression_;
+                RCLCPP_INFO(get_logger(), "MCAP compression profile: %s", mcap_compression_.c_str());
+            }
 
             rosbag2_cpp::ConverterOptions converter_options;
             converter_options.input_serialization_format = rmw_get_serialization_format();
@@ -407,6 +336,7 @@ private:
                 meta_rear.type = "sensor_msgs/msg/CompressedImage";
                 meta_rear.serialization_format = rmw_get_serialization_format();
                 writer_.create_topic(meta_rear);
+
             } else {
                 rosbag2_storage::TopicMetadata meta_front;
                 meta_front.name = front_topic_;
@@ -419,6 +349,7 @@ private:
                 meta_rear.type = "sensor_msgs/msg/Image";
                 meta_rear.serialization_format = rmw_get_serialization_format();
                 writer_.create_topic(meta_rear);
+
             }
 
             rosbag2_storage::TopicMetadata meta_imu;
@@ -433,48 +364,179 @@ private:
         return true;
     }
 
+    bool LoadFilePaths(const std::string& path) {
+        file_paths_.clear();
+        if (path.empty()) {
+            return false;
+        }
+
+        std::error_code ec;
+        const std::filesystem::path p(path);
+        if (std::filesystem::is_directory(p, ec)) {
+            for (const auto& entry : std::filesystem::directory_iterator(p, ec)) {
+                if (ec) {
+                    break;
+                }
+                if (!entry.is_regular_file()) {
+                    continue;
+                }
+                const auto ext = entry.path().extension().string();
+                std::string ext_lower;
+                ext_lower.resize(ext.size());
+                std::transform(ext.begin(), ext.end(), ext_lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (ext_lower == ".insv" || ext_lower == ".lrv") {
+                    file_paths_.push_back(entry.path().string());
+                }
+            }
+            std::sort(file_paths_.begin(), file_paths_.end());
+        } else if (std::filesystem::is_regular_file(p, ec)) {
+            file_paths_.push_back(path);
+        }
+
+        if (file_paths_.empty()) {
+            return false;
+        }
+        return true;
+    }
+
+    bool ProcessFile(const std::string& path) {
+        ResetPerFileState();
+        file_path_ = path;
+        RCLCPP_INFO(get_logger(), "Current global_time_offset_sec: %.3f", global_time_offset_sec_);
+
+        if (!ParseTrailer(path)) {
+            return false;
+        }
+        if (!ProbeVideoWindow()) {
+            return false;
+        }
+        AlignImu(); // trim IMU samples using video time window, since IMU ts are already aligned to video timestamps using first_frame_timestamp
+        WriteImuSamples();
+        if (save_images_) {
+            DecodeAndWriteVideo();
+        }
+
+        if (std::isfinite(video_dur_sec_)) {
+            global_time_offset_sec_ += video_dur_sec_ - video_frame_overlap_sec_;
+            last_video_trailer_lft_sec_ = curr_video_trailer_fft_sec_ + video_dur_sec_;
+        }
+        return true;
+    }
+
+    void ResetPerFileState() {
+        imu_samples_.clear();
+        video_min_sec_ = std::numeric_limits<double>::quiet_NaN();
+        video_max_sec_ = std::numeric_limits<double>::quiet_NaN();
+        video_dur_sec_ = std::numeric_limits<double>::quiet_NaN();
+        frame_interval_sec_ = 0.001;
+        video_frame_overlap_sec_ = 0.0;
+    }
+
+    bool ParseTrailer(const std::string& file) {
+        insta360_insv::TrailerParser parser;
+        parser.SetVerbose(verbose_);
+        std::string err;
+        if (!parser.ParseFile(file, imu_samples_, &err)) {
+            RCLCPP_ERROR(get_logger(), "Failed to parse trailer: %s", err.c_str());
+            return false;
+        }
+
+        curr_video_trailer_fft_sec_ = parser.GetMetadataState().have_first_frame_timestamp ? 
+            parser.GetMetadataState().first_frame_timestamp_sec : std::numeric_limits<double>::quiet_NaN();
+        video_frame_overlap_sec_ = std::isfinite(last_video_trailer_lft_sec_) ? last_video_trailer_lft_sec_ - curr_video_trailer_fft_sec_ : 0.0;
+        RCLCPP_INFO(get_logger(), "Video frame overlap between files: %.3f sec (current trailer FFT=%.3f sec, last trailer LFT=%.3f sec)", 
+            video_frame_overlap_sec_, curr_video_trailer_fft_sec_, last_video_trailer_lft_sec_);
+
+        if (!imu_samples_.empty()) {
+            RCLCPP_INFO(get_logger(), "IMU records parsed: %zu total, timestamp interval=[%.3f, %.3f]", 
+                imu_samples_.size(), imu_samples_.front().time_sec, imu_samples_.back().time_sec);
+        } else {
+            RCLCPP_WARN(get_logger(), "No IMU records parsed from trailer!");
+        }
+        return true;
+    }
+
+    bool ProbeVideoWindow() {
+        insta360_insv::InsvVideoDecoder decoder(file_path_, decoder_threads_);
+        std::string derr;
+        if (!decoder.open(&derr)) {
+            RCLCPP_ERROR(get_logger(), "Decoder open failed: %s", derr.c_str());
+            return false;
+        }
+
+        double vmin = 0.0;
+        double vmax = 0.0;
+        std::size_t frame_count = 0;
+        if (!decoder.probe_time_window(vmin, vmax, &frame_count, &derr)) {
+            RCLCPP_ERROR(get_logger(), "Failed to probe video timestamps: %s", derr.c_str());
+            return false;
+        }
+
+        if (!std::isfinite(vmin) || !std::isfinite(vmax)) {
+            RCLCPP_ERROR(get_logger(), "Video timestamps are not finite (min=%.3f max=%.3f)", vmin, vmax);
+            return false;
+        }
+
+        video_min_sec_ = vmin;
+        video_max_sec_ = vmax;
+        video_dur_sec_ = std::max(0.0, video_max_sec_ - video_min_sec_);
+
+        // Estimate frame interval 
+        double avg_vid_gap_sec = video_dur_sec_ / std::max<size_t>(frame_count - 1, 1);
+        frame_interval_sec_ = avg_vid_gap_sec;
+        // if (multi_files_) { 
+        //     time_window_margin_sec_ = avg_vid_gap_sec; 
+        // }
+        RCLCPP_INFO(get_logger(), "Probed video window: [%.3f, %.3f] sec (duration=%.3f sec, frame_count=%zu), estimated frame interval=%.3f sec, time_window_margin_sec_: %.3f", \
+            video_min_sec_, video_max_sec_, video_dur_sec_, frame_count, avg_vid_gap_sec, time_window_margin_sec_);
+
+        return true;
+    }
+
+    void AlignImu() {
+        if (imu_samples_.empty()) {
+            RCLCPP_WARN(get_logger(), "IMU empty before IMU Alignment - FINAL WINDOW: video [%.3f, %.3f], imu [no samples remain after filtering]", video_min_sec_, video_max_sec_);
+            return;
+        }
+
+        const double imu_rh_sec = video_max_sec_ + time_window_margin_sec_;
+
+        const size_t original_imu_count = imu_samples_.size();
+        std::vector<insta360_insv::ImuSample> valid_imu;
+        valid_imu.reserve(imu_samples_.size());
+        for (const auto& s : imu_samples_) {
+            if (std::isfinite(s.raw_time) && s.time_sec >= video_min_sec_&& s.time_sec <= imu_rh_sec) {
+                valid_imu.push_back(s);
+            }
+        }
+
+        if (!valid_imu.empty()) {
+            imu_samples_.swap(valid_imu);
+        } else {
+            RCLCPP_WARN(get_logger(), "No IMU samples within video time window [%.3f, %.3f]; all %zu samples are outside the window", 
+                video_min_sec_, video_max_sec_, original_imu_count);
+        }
+
+        RCLCPP_INFO(get_logger(), "IMU records truncated: Video window with rh margin [%.3f, %.3f(%.3f + %.3f)] sec, imu valid samples within window=%zu (dropped %zu outside window)",
+            video_min_sec_, imu_rh_sec, video_max_sec_, time_window_margin_sec_, imu_samples_.size(), original_imu_count - imu_samples_.size());
+    }
+
     void WriteImuSamples() {
         rclcpp::Serialization<sensor_msgs::msg::Imu> serializer;
         size_t skipped = 0;
-        size_t reason_not_finite = 0;
-        size_t reason_negative = 0;
-        size_t sanity_warned = 0;
-        size_t logged_examples = 0;
         for (const auto& s : imu_samples_) {
-            if (!std::isfinite(s.time_sec)) {
-                skipped++;
-                reason_not_finite++;
-                if (logged_examples < 10) {
-                    RCLCPP_WARN(get_logger(),
-                                "Skip IMU: non-finite time_sec (raw=%.3f, scale=%.6g, offset=%.6f)",
-                                s.raw_time, imu_time_scale_, imu_time_offset_);
-                    logged_examples++;
-                }
+            const double aligned_time = s.time_sec + global_time_offset_sec_ - video_frame_overlap_sec_;
+            if (s.time_sec <= video_frame_overlap_sec_) {
+                ++skipped;
                 continue;
             }
-            if (std::isfinite(video_max_sec_) && s.time_sec > video_max_sec_ + time_window_margin_sec_ && sanity_warned < 10) {
-                RCLCPP_WARN(get_logger(),
-                            "IMU timestamp %.3f exceeds video end + margin (%.3f + %.3f)",
-                            s.time_sec, video_max_sec_, time_window_margin_sec_);
-                ++sanity_warned;
-            }
-            if (!(s.time_sec >= -1.0 && s.time_sec <= (static_cast<double>(std::numeric_limits<int64_t>::max())/1e9))) {
-                skipped++;
-                reason_negative++;
-                if (logged_examples < 10) {
-                    RCLCPP_WARN(get_logger(),
-                                "Skip IMU: out-of-range stamp (time_sec=%.6f raw=%.3f scale=%.6g offset=%.6f)",
-                                s.time_sec, s.raw_time, imu_time_scale_, imu_time_offset_);
-                    logged_examples++;
-                }
-                continue;
-            }
-            const int64_t stamp_ns = static_cast<int64_t>(s.time_sec * 1e9);
+            const int64_t stamp_ns = static_cast<int64_t>(aligned_time * 1e9);
             const rclcpp::Time stamp(stamp_ns);
             sensor_msgs::msg::Imu msg;
             msg.header.stamp = stamp;
             msg.header.frame_id = imu_frame_id_;
 
+            // Always publish angular velocity in rad/s as required by ROS.
             msg.angular_velocity.x = s.gx;
             msg.angular_velocity.y = s.gy;
             msg.angular_velocity.z = s.gz;
@@ -494,9 +556,10 @@ private:
             std::shared_ptr<const rclcpp::SerializedMessage> serialized_ptr =
                 std::make_shared<rclcpp::SerializedMessage>(serialized);
             writer_.write(serialized_ptr, imu_topic_, "sensor_msgs/msg/Imu", stamp);
+            last_written_imu_time_ = aligned_time;
         }
         if (skipped > 0) {
-            RCLCPP_WARN(get_logger(), "Skipped %zu IMU samples with invalid timestamps", skipped);
+            RCLCPP_WARN(get_logger(), "Skipped %zu IMU samples due to video frames overlap between files", skipped);
         }
         RCLCPP_INFO(get_logger(), "Wrote %zu IMU samples", imu_samples_.size() - skipped);
     }
@@ -507,17 +570,6 @@ private:
         if (!decoder.open(&derr)) {
             RCLCPP_ERROR(get_logger(), "Decoder open failed: %s", derr.c_str());
             return;
-        }
-
-        double offset_sec = 0.0;
-        if (!video_ts_raw_.empty() && std::isfinite(video_min_sec_)) {
-            const double vmin = video_ts_raw_.front();
-            const double vmax = video_ts_raw_.back();
-            const double vspan = std::max(0.0, vmax - vmin);
-            const double vscale = (vspan > 1e6 ? 1e-6 : 1e-3);
-            const double base_ts = vmin * vscale;
-            offset_sec = video_min_sec_ - base_ts;
-            RCLCPP_INFO(get_logger(), "Computed offset_sec=%.6f (video_start=%.6f, trailer_ts=%.6f)", offset_sec, video_min_sec_, base_ts);
         }
 
         const std::string rear_topic_to_write = compressed_images_ ? rear_topic_ + "/compressed" : rear_topic_;
@@ -581,15 +633,24 @@ private:
             return std::packaged_task<EncodedFrameResult()>(
                 [seq,
                  frame = std::move(frame),
-                 offset_sec,
                  compressed = compressed_images_,
                  fmt = image_transport_format_,
                  jpeg_q = jpeg_quality_,
                  frame_id_front = frame_id_front_,
-                 frame_id_rear = frame_id_rear_]() mutable {
+                 frame_id_rear = frame_id_rear_,
+                 crop_enabled = crop_enabled_,
+                 crop_ratio = crop_ratio_,
+                 resize_width = resize_width_,
+                 resize_height = resize_height_,
+                 video_frame_overlap_sec = video_frame_overlap_sec_,
+                 global_offset = global_time_offset_sec_]() mutable {
                     EncodedFrameResult result;
                     result.seq = seq;
-                    const double stamp_sec = frame.t_video - offset_sec;
+                    const double stamp_sec = frame.t_video + global_offset - video_frame_overlap_sec;
+                    if (frame.t_video <= video_frame_overlap_sec) {
+                        // Skip frames that are within the overlap region between files, since their timestamps may not be unique after alignment
+                        if (global_offset != 0.0) { return result; }
+                    }
                     if (!std::isfinite(stamp_sec)) {
                         return result;
                     }
@@ -635,12 +696,50 @@ private:
                         return std::shared_ptr<const rclcpp::SerializedMessage>(serialized);
                     };
 
+                    auto center_crop = [&](const cv::Mat& image) -> cv::Mat {
+                        if (!crop_enabled || image.empty()) {
+                            return cv::Mat();
+                        }
+                        const int min_dim = std::min(image.cols, image.rows);
+                        if (min_dim <= 0) {
+                            return cv::Mat();
+                        }
+                        const int edge = static_cast<int>(std::round(static_cast<double>(min_dim) * crop_ratio));
+                        if (edge <= 0 || edge >= min_dim) {
+                            return cv::Mat();
+                        }
+                        const int x = (image.cols - edge) / 2;
+                        const int y = (image.rows - edge) / 2;
+                        return image(cv::Rect(x, y, edge, edge));
+                    };
+
+                    cv::Mat rear_image = crop_enabled ? center_crop(frame.rear) : frame.rear;
+                    cv::Mat front_image = crop_enabled ? center_crop(frame.front) : frame.front;
+                    if (rear_image.empty() || front_image.empty()) {
+                        return result;
+                    }
+
+                    if (resize_width > 0 && resize_height > 0) {
+                        cv::Mat resized_rear;
+                        cv::Mat resized_front;
+                        const int rear_interpolation =
+                            resize_width < rear_image.cols || resize_height < rear_image.rows ?
+                            cv::INTER_AREA : cv::INTER_LINEAR;
+                        const int front_interpolation =
+                            resize_width < front_image.cols || resize_height < front_image.rows ?
+                            cv::INTER_AREA : cv::INTER_LINEAR;
+                        cv::resize(rear_image, resized_rear, cv::Size(resize_width, resize_height), 0.0, 0.0, rear_interpolation);
+                        cv::resize(front_image, resized_front, cv::Size(resize_width, resize_height), 0.0, 0.0, front_interpolation);
+                        rear_image = std::move(resized_rear);
+                        front_image = std::move(resized_front);
+                    }
+
                     if (compressed) {
-                        result.rear_msg = encode_compressed(frame.rear, frame_id_rear);
-                        result.front_msg = encode_compressed(frame.front, frame_id_front);
+                        result.rear_msg = encode_compressed(rear_image, frame_id_rear);
+                        result.front_msg = encode_compressed(front_image, frame_id_front);
                     } else {
-                        result.rear_msg = encode_raw(frame.rear, frame_id_rear);
-                        result.front_msg = encode_raw(frame.front, frame_id_front);
+                        result.rear_msg = encode_raw(rear_image, frame_id_rear);
+                        result.front_msg = encode_raw(front_image, frame_id_front);
                     }
                     result.valid = (result.rear_msg && result.front_msg);
                     return result;
@@ -674,12 +773,13 @@ private:
             RCLCPP_WARN(get_logger(), "Stream decode produced zero frames");
         }
         if (skipped_frames > 0) {
-            RCLCPP_WARN(get_logger(), "Skipped %zu frames with invalid timestamps or encoding failures", skipped_frames);
+            RCLCPP_WARN(get_logger(), "Skipped %zu video frames with invalid/overlapping timestamps or encoding failures", skipped_frames);
         }
         RCLCPP_INFO(get_logger(), "Wrote %zu video frames (front+rear)", frames_written);
     }
 
     // Params
+    std::vector<std::string> file_paths_;
     std::string file_path_;
     std::string bag_path_;
     std::string front_topic_;
@@ -689,24 +789,37 @@ private:
     std::string frame_id_rear_;
     std::string imu_frame_id_;
 
+    bool save_images_{true};
+    bool multi_files_{false};
+
+    double global_time_offset_sec_{0.0};
+    double last_written_imu_time_{-std::numeric_limits<double>::infinity()};
+    double last_video_trailer_lft_sec_{-std::numeric_limits<double>::infinity()}; // last frame timestamp of video 
+    double curr_video_trailer_fft_sec_{std::numeric_limits<double>::quiet_NaN()}; // first_frame_timestamp from trailer
+    double video_frame_overlap_sec_{0.0}; // video frame overlap between files: max(0, last_video_trailer_lft_sec - curr_video_trailer_fft_sec)
+
     // Trailer data
-    std::vector<double> video_ts_raw_;
     std::vector<insta360_insv::ImuSample> imu_samples_;
 
+    bool verbose_{false};
     bool compressed_images_{false};
     std::string image_transport_format_ = "jpeg";
     std::string storage_id_param_ = "sqlite3";
+    std::string mcap_compression_ = "zstd_fast";
 
     // Alignment parameters
-    double imu_time_scale_{1e-3};
-    double imu_time_offset_{0.0};
     double video_min_sec_{std::numeric_limits<double>::quiet_NaN()};
     double video_max_sec_{std::numeric_limits<double>::quiet_NaN()};
     double video_dur_sec_{std::numeric_limits<double>::quiet_NaN()};
-    double time_window_margin_sec_{0.05};
+    double frame_interval_sec_{0.001};
+    double time_window_margin_sec_{0};
+    double crop_ratio_{0.0};
+    int resize_width_{0};
+    int resize_height_{0};
     int jpeg_quality_{90};
     int encoding_threads_{1};
     int decoder_threads_{1};
+    bool crop_enabled_{false};
 
     rosbag2_cpp::Writer writer_;
 };

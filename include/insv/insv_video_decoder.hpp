@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <functional>
 #include <string>
 #include <vector>
@@ -8,8 +9,8 @@
 namespace insta360_insv {
 
 struct DecodedFrame {
-    cv::Mat front;   // right half of SxS frame
-    cv::Mat rear;    // left half of SxS frame
+    cv::Mat front;   
+    cv::Mat rear;    
     double t_video;  // seconds, computed from pts * time_base
 };
 
@@ -21,7 +22,7 @@ public:
     void set_decode_threads(int decode_threads);
 
     bool open(std::string* error_out = nullptr);
-    bool probe_time_window(double& min_sec, double& max_sec, std::string* error_out = nullptr);
+    bool probe_time_window(double& min_sec, double& max_sec, std::size_t* frame_count = nullptr, std::string* error_out = nullptr);
     bool stream_decode(const std::function<bool(DecodedFrame&&)>& on_frame,
                       std::string* error_out = nullptr);
 
