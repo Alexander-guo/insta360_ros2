@@ -140,7 +140,7 @@ This uses the [imu_filter_madgwick](https://wiki.ros.org/imu_filter_madgwick) pa
 You can adjust the extrinsic parameters used to improve the equirectangular image. 
 ```
 # Run the camera driver
-ros2 run insta360_ros insta360_ros_driver
+ros2 run insta360_ros insta360_ros
 # Activate image decoding
 ros2 run insta360_ros decoder
 # Run the equirectangular node in calibration mode
