@@ -1,4 +1,4 @@
-# insta360_ros_driver
+# insta360_ros
 
 
 
@@ -51,7 +51,7 @@ Additionally, **ensure the camera's USB mode is set to Android**:
 
 The Insta360 requires sudo privilege to be accessed via USB. To compensate for this, a udev configuration can be automatically created that will only request for sudo once. The camera can thus be setup initially via:
 ```
-cd ~/ros2_ws/src/insta360_ros_driver
+cd ~/ros2_ws/src/insta360_ros
 ./setup.sh
 ```
 This creates a symlink  based on the vendor ID of Insta360 cameras. The symlink, in this case <code>/dev/insta</code> is used to grant permissions to the usb port used by the camera. **Make sure you run it on your host system if you are in a container!!**
@@ -70,7 +70,7 @@ sudo chmod 777 /dev/insta
 
 ### `INSV2BAG Converter`
 ```
-ros2 launch insta360_ros_driver insv_dual_fisheye_bag.launch.py file_path:=<path_to_INSV_file> bag_path:=<path_to_output_bag>
+ros2 launch insta360_ros insv_dual_fisheye_bag.launch.py file_path:=<path_to_INSV_file> bag_path:=<path_to_output_bag>
 ```
 Check parameters in [insv_dual_fisheye_bag_node.cpp](src/insv_dual_fisheye_bag_node.cpp)  and modify accordingly in [insv_dual_fisheye_bag.launch.py](launch/insv_dual_fisheye_bag.launch.py).
 
@@ -86,12 +86,13 @@ The [launch file](launch/insv_dual_fisheye_bag.launch.py) exposes the following 
 - `imu_frame_id` (default `imu_frame`) – Frame identifier applied to IMU data.
 - `compressed_images` (default `true`) – When true, the node only writes `sensor_msgs/CompressedImage` under `<topic>/compressed` instead of raw images.
 - `image_transport_format` (default `jpeg`) – Encoding format for compressed images; switch to `png` for lossless storage.
-- `storage_id` (default `db3`) – rosbag2 storage backend (`db3` for SQLite, `mcap` for MCAP).
+- `storage_id` (default `mcap`) – rosbag2 storage backend (`db3` for SQLite, `mcap` for MCAP).
+- `mcap_compression` (default `zstd_fast`) – MCAP chunk compression profile (`none`, `zstd_fast`, or `zstd_small`); ignored for SQLite.
 - `global_ts_offset` (default `10000.0`) – Global timestamp offset in seconds added when writing both IMU and image messages to the bag. The first bag messages will start near this offset instead of near `0`.
 - `jpeg_quality` (default `50`) – Quality level (1–100) for `JPEG` encoding; ignored when `image_transport_format` is `png`.
 - `encoding_threads` (default `0`) – Number of worker threads used for image compression (`0` use all the cpu cores).
 - `decoder_threads` (default `0`) – Number of FFmpeg threads dedicated to video decoding (`0` use all the cpu cores).
-- `crop_ratio` (default `0.75`) - Center crop ratio (`0` or `1` = disabled, `(0,1)` crops square). Writes cropped images to `<topic>/cropped(/compressed)` if enabled.
+- `crop_ratio` (default `1.0`) – Center crop ratio (`0` or `1` writes original images; `(0,1)` writes only the cropped images on the standard image topics).
 - `time_window_margin_sec` (default `0.05`) - Time padding (in seconds) added before the first and after the last video frame when filtering and validating IMU samples. If processing multiple videos, this margin is decided automatically based on the interval between video frames.
 - `save_images` (default `true`) - If true, save images to the rosbag2; if false, only save IMU data (useful for debugging or when images are not needed).
 
@@ -107,7 +108,7 @@ The camera provides images natively in H264 compressed image format.
 
 The camera can be brought up with the following launch file
 ```
-ros2 launch insta360_ros_driver bringup.launch.xml
+ros2 launch insta360_ros bringup.launch.xml
 ```
 ![bringup](docs/bringup_rqt.png)
 
@@ -138,11 +139,11 @@ This uses the [imu_filter_madgwick](https://wiki.ros.org/imu_filter_madgwick) pa
 You can adjust the extrinsic parameters used to improve the equirectangular image. 
 ```
 # Run the camera driver
-ros2 run insta360_ros_driver insta360_ros_driver
+ros2 run insta360_ros insta360_ros_driver
 # Activate image decoding
-ros2 run insta360_ros_driver decoder
+ros2 run insta360_ros decoder
 # Run the equirectangular node in calibration mode
-ros2 run insta360_ros_driver equirectangular.py --calibrate
+ros2 run insta360_ros equirectangular.py --calibrate
 ```
 This will open an app to adjust the extrinsics. You can press 's' to get the parameters in YAML format.
 ![Equirectangular Calibration](docs/calibration.png)
